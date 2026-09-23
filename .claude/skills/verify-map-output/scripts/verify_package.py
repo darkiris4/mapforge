@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Validate a MapForge package and render a contact sheet.
 
-usage: verify_package.py PACKAGE_DIR [--sheet OUT.png] [--json]
+usage: verify_package.py PACKAGE_DIR|LAYER_DIR [--sheet OUT.png] [--json]
 
 Checks every file listed in each layer's layer.json:
   GeoTIFF   EPSG:4326, tiled, overviews, sensible compression, bounds match the package bbox,
@@ -160,14 +160,18 @@ def main() -> int:
     ap.add_argument("--json", action="store_true", help="print results as JSON")
     a = ap.parse_args()
     pkg = Path(a.package)
-    man = pkg / "manifest.json"
-    if not man.exists():
-        print(f"FAIL {pkg}: no manifest.json — is this a MapForge package folder?")
+    man, single = pkg / "manifest.json", pkg / "layer.json"
+    if man.exists():
+        manifest = json.loads(man.read_text())
+        if not (pkg / "README.txt").exists():
+            rec("WARN", "README.txt", "missing")
+    elif single.exists():  # a single layer folder
+        layer = json.loads(single.read_text())
+        manifest = {"bbox_wsen": layer.get("bbox"), "layers": [{**layer, "folder": "."}]}
+    else:
+        print(f"FAIL {pkg}: no manifest.json or layer.json — pass a package or layer folder")
         return 1
-    manifest = json.loads(man.read_text())
     bbox = manifest.get("bbox_wsen")
-    if not (pkg / "README.txt").exists():
-        rec("WARN", "README.txt", "missing")
     thumbs = []
     for layer in manifest.get("layers", []):
         if layer.get("status") != "ok":
