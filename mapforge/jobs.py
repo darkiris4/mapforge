@@ -19,6 +19,7 @@ from .sources import Cancelled, Context, registry
 
 # 96 dpi screen: one pixel ≈ 0.2646 mm, so a raster "looks native" at 1 : res_m / 0.0002646.
 PX_M = 0.0002645833
+JOB_ID_RE = re.compile(r"\d{8}-\d{6}-[0-9a-f]{6}")
 
 
 def _safe(s: str) -> str:
@@ -62,9 +63,15 @@ class JobManager:
         layers = spec.get("layers") or []
         if not layers:
             raise ValueError("Select at least one layer")
+        seen = set()
         for layer in layers:
             if layer["source"] not in reg:
                 raise ValueError(f"Unknown source {layer['source']}")
+            if layer["source"] in seen:
+                raise ValueError(f"{reg[layer['source']].name} is selected twice")
+            seen.add(layer["source"])
+            if layer.get("res_m") not in (None, "") and not float(layer["res_m"]) > 0:
+                raise ValueError(f"{reg[layer['source']].name}: resolution must be a positive number of metres")
         o = spec.get("outputs") or {}
         outputs = OutputOptions(geotiff=o.get("geotiff", True), cog=o.get("cog", False),
                                 mbtiles=o.get("mbtiles", False),
@@ -111,16 +118,24 @@ class JobManager:
         if jid in self.cancel:
             self.cancel[jid].set()
 
-    def delete(self, jid: str) -> None:
+    def delete(self, jid: str) -> bool:
+        # Only ever remove directories of jobs we know about: jid comes from the URL.
+        if jid not in self.jobs or not JOB_ID_RE.fullmatch(jid):
+            return False
         self.cancel_job(jid)
         self.jobs.pop(jid, None)
         shutil.rmtree(self.s.jobs_dir / jid, ignore_errors=True)
+        return True
 
     def _run(self, jid: str, bbox: BBox, layers: list[dict], outputs: OutputOptions) -> None:
         j = self.jobs[jid]
         pkg = self.s.jobs_dir / jid / j["name"]
         pkg.mkdir(parents=True, exist_ok=True)
-        j.update(status="running", package=str(pkg))
+        if self.cancel[jid].is_set():
+            j.update(status="cancelled", message="Cancelled before start", finished=time.time())
+            self._save(j)
+            return
+        j.update(status="running", package=str(pkg), started=time.time())
         last_save = [0.0]
 
         def progress(i: int, n: int):
@@ -128,6 +143,7 @@ class JobManager:
                 j["message"] = msg
                 if frac is not None:
                     j["progress"] = round((i + frac) / n, 4)
+                    j["layer_progress"] = round(frac, 4)
                 if not j["log"] or j["log"][-1][1] != msg:
                     if frac is None or frac in (0, 1):
                         j["log"] = (j["log"] + [[time.time(), msg]])[-200:]
@@ -140,6 +156,8 @@ class JobManager:
         try:
             for i, layer in enumerate(layers):
                 src = reg[layer["source"]]
+                j["current"] = {"index": i, "count": len(layers), "name": src.name}
+                j["layer_progress"] = 0.0
                 ctx = Context(self.s, progress(i, len(layers)), self.cancel[jid])
                 lopts = LayerOptions(res_m=float(layer["res_m"]) if layer.get("res_m") else None,
                                      compression=layer.get("compression", "auto"))
@@ -166,6 +184,7 @@ class JobManager:
         except Exception as e:
             j.update(status="failed", message=str(e))
         j["finished"] = time.time()
+        j.pop("current", None)
         self._save(j)
 
     def _write_manifest(self, j: dict, pkg: Path, bbox: BBox) -> None:
