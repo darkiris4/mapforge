@@ -103,6 +103,9 @@ class Item:
     label: str = ""
     gdal_env: dict[str, str] = field(default_factory=dict)
     native_res_m: float | None = None
+    # Optional lon/lat polygons ([(lon, lat), ...]); only pixels inside all of them are used.
+    # Charts use this to drop collars/legends outside the neatline.
+    clip: list[list[tuple[float, float]]] | None = None
 
 
 @dataclass

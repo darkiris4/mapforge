@@ -16,6 +16,7 @@ from mapforge.process import LayerOptions, OutputOptions, build_layer, dted_cell
 from mapforge.settings import Settings
 from mapforge.sources.base import Auth, Context
 from mapforge.sources.custom import endpoint_to_source
+from mapforge.sources.faa import clip_polygons, detect_clip
 from mapforge.sources.local import LocalProduct, scan
 
 
@@ -44,8 +45,8 @@ def write_dem(path: Path, bounds, size=120, base=100.0):
 
 
 class FileSource(sources.Source):
-    def __init__(self, paths, kind="rgb", resampling="nearest"):
-        self.paths, self.kind, self.resampling = paths, kind, resampling
+    def __init__(self, paths, kind="rgb", resampling="nearest", clip=False):
+        self.paths, self.kind, self.resampling, self.clip = paths, kind, resampling, clip
         self.id, self.name, self.default_res_m = "test", "Test", 100.0
 
     def items(self, bbox, res_m, ctx):
@@ -53,7 +54,8 @@ class FileSource(sources.Source):
         for p in self.paths:
             with rasterio.open(p) as ds:
                 b = BBox(*ds.bounds)
-            out.append(sources.Item(path=str(p), footprint=b, label=p.name))
+            clip = clip_polygons(p, detect_clip(p)) if self.clip else None
+            out.append(sources.Item(path=str(p), footprint=b, label=p.name, clip=clip))
         return out
 
 
@@ -82,15 +84,33 @@ def test_dted_grids():
     assert (nx, ny) == (1801, 3601)
 
 
-def test_chart_mosaic_drops_collars(settings, tmp_path):
-    # Two charts overlapping by their collars: A (red interior) west, B (blue interior) east.
-    a, b = tmp_path / "a.tif", tmp_path / "b.tif"
+def test_detect_clip_finds_collars(tmp_path):
+    a = tmp_path / "a.tif"
     write_chart(a, (0.0, 0.0, 1.1, 1.0), fill_index=1, collar_index=9)
-    write_chart(b, (0.9, 0.0, 2.0, 1.0), fill_index=2, collar_index=9)
-    src = FileSource([a, b])
+    c = detect_clip(a)
+    assert c["px"] == [20, 20, 180, 180]
+    # a white-background "chart" (no collar/face contrast) must not be clipped
+    b = tmp_path / "b.tif"
+    write_chart(b, (0.0, 0.0, 1.0, 1.0), fill_index=9, collar_index=9)
+    assert detect_clip(b)["px"] is None
+
+
+def test_chart_mosaic_drops_collars(settings, tmp_path):
+    # A (red face, wide 0.24 deg collar) west of B (blue face, thin collar).  In the overlap
+    # A's collar is "deeper inside" A than the same spot is inside B, so the plain depth rule
+    # leaks A's collar (as FAA sectional legends did); neatline clipping must not.
+    a, b = tmp_path / "a.tif", tmp_path / "b.tif"
+    write_chart(a, (0.0, 0.0, 1.2, 1.0), fill_index=1, collar_index=9, collar=40)
+    write_chart(b, (0.9, 0.0, 2.0, 1.0), fill_index=2, collar_index=9, collar=5)
+    bbox = BBox(0.3, 0.3, 1.8, 0.7)
+    leaky = build_layer(FileSource([a, b]), bbox, LayerOptions(res_m=1000), OutputOptions(), tmp_path / "leaky",
+                        Context(settings), "mosaic")
+    with rasterio.open(tmp_path / "leaky" / "mosaic.tif") as ds:
+        assert (ds.read() == 255).all(axis=0).any(), "fixture should reproduce the collar leak without clipping"
+    src = FileSource([a, b], clip=True)
     out = tmp_path / "out"
-    res = build_layer(src, BBox(0.2, 0.2, 1.8, 0.8), LayerOptions(res_m=1000), OutputOptions(), out,
-                      Context(settings), "mosaic")
+    res = build_layer(src, bbox, LayerOptions(res_m=1000), OutputOptions(), out, Context(settings), "mosaic")
+    assert leaky["status"] == "ok"
     assert res["status"] == "ok" and res["coverage_pct"] == 100.0
     with rasterio.open(out / "mosaic.tif") as ds:
         assert ds.crs.to_epsg() == 4326 and ds.count == 3
@@ -102,7 +122,8 @@ def test_chart_mosaic_drops_collars(settings, tmp_path):
 
 def test_elevation_geotiff_and_dted(settings, tmp_path):
     dem = tmp_path / "dem.tif"
-    write_dem(dem, (-78.0, 38.0, -76.0, 39.0), size=240)
+    # DTED posts sit half a spacing outside the 1-degree cell edges, so cover a margin too.
+    write_dem(dem, (-78.1, 37.9, -75.9, 39.1), size=264)
     src = FileSource([dem], kind="elevation", resampling="bilinear")
     out = tmp_path / "out"
     res = build_layer(src, BBox(-77.6, 38.2, -76.4, 38.8), LayerOptions(res_m=2000),
@@ -111,7 +132,7 @@ def test_elevation_geotiff_and_dted(settings, tmp_path):
     with rasterio.open(out / "dted/w077/n38.dt0") as ds:
         assert ds.driver == "DTED" and (ds.width, ds.height) == (121, 121)
         z = ds.read(1)
-        assert z.min() >= 100 and z.max() <= 100 + 480
+        assert z.min() >= 100 and z.max() <= 100 + 2 * 264
     with rasterio.open(out / "dem.tif") as ds:
         assert ds.dtypes[0] == "float32" and ds.nodata == -32767
 
@@ -170,3 +191,18 @@ def test_api_roundtrip(settings, tmp_path):
     r = client.get(f"/api/jobs/{jid}/download")
     assert r.status_code == 200 and r.content[:2] == b"PK"
     assert client.post("/api/endpoints", json={"name": "x", "type": "bogus", "url": "u"}).status_code == 400
+
+
+def test_render_honours_cancel(settings, tmp_path):
+    from mapforge.process import open_item, render
+    from contextlib import ExitStack
+
+    a = tmp_path / "a.tif"
+    write_chart(a, (0.0, 0.0, 1.0, 1.0), 1, 9)
+    ctx = Context(settings)
+    ctx.cancel_event.set()
+    item = FileSource([a]).items(None, 0, ctx)[0]
+    with ExitStack() as st:
+        o = open_item(item, "rgb", 1000, st)
+        with pytest.raises(sources.Cancelled):
+            render([o], "rgb", from_bounds(0, 0, 1, 1, 64, 64), 64, 64, 1000, "nearest", ctx.check)

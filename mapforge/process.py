@@ -113,9 +113,10 @@ def _to_uint8(a: np.ndarray, dtype: str) -> np.ndarray:
     return np.clip(a, 0, 255).astype(np.uint8)
 
 
-def _prefetch(ds, bbox: BBox) -> None:
-    """Read the source window in one call so GDAL's WMS driver fetches its tiles in parallel
-    (the warper otherwise requests them in small, serial chunks)."""
+def _prefetch(ds, bbox: BBox, check=None) -> None:
+    """Read the source window so GDAL's WMS driver fetches its tiles in parallel (the warper
+    otherwise requests them in small, serial chunks).  Read in bounded chunks so a cancel
+    request is noticed between them instead of after a whole slow block."""
     from rasterio.warp import transform_bounds
     from rasterio.windows import from_bounds
 
@@ -123,17 +124,47 @@ def _prefetch(ds, bbox: BBox) -> None:
         b = transform_bounds(WGS84, ds.crs, *bbox.as_tuple(), densify_pts=5)
         win = from_bounds(*b, transform=ds.transform).round_offsets().round_lengths()
         win = win.intersection(Window(0, 0, ds.width, ds.height))
-        if 0 < win.width * win.height <= 64_000_000:
-            ds.read(window=win)
     except Exception:
-        pass  # purely an optimisation
+        return  # purely an optimisation
+    if not 0 < win.width * win.height <= 64_000_000:
+        return
+    step = 2048
+    for r in range(int(win.row_off), int(win.row_off + win.height), step):
+        for c in range(int(win.col_off), int(win.col_off + win.width), step):
+            if check:
+                check()
+            sub = Window(c, r, min(step, win.col_off + win.width - c), min(step, win.row_off + win.height - r))
+            try:
+                ds.read(window=sub)
+            except Exception:
+                pass
+
+
+def _clip_mask(polys, transform: Affine, width: int, height: int) -> np.ndarray:
+    """True where a pixel centre lies inside every clip polygon (lon/lat)."""
+    from rasterio.features import geometry_mask
+
+    m = np.ones((height, width), bool)
+    for poly in polys:
+        geom = {"type": "Polygon", "coordinates": [[list(p) for p in poly]]}
+        m &= geometry_mask([geom], out_shape=(height, width), transform=transform, invert=True)
+    return m
+
+
+def _clip_bbox(polys, fp: BBox) -> BBox:
+    """Footprint shrunk to the clip polygons, so mosaic priority is measured from the neatline."""
+    out = fp
+    for poly in polys:
+        xs, ys = [p[0] for p in poly], [p[1] for p in poly]
+        out = out.intersection(BBox(max(min(xs), -180), max(min(ys), -90), min(max(xs), 180), min(max(ys), 90))) or out
+    return out
 
 
 # --------------------------------------------------------------------------------------
 # Rendering one grid window
 # --------------------------------------------------------------------------------------
 def render(opened: list[Opened], kind: str, transform: Affine, width: int, height: int,
-           target_res_m: float, resampling: str) -> tuple[np.ndarray, np.ndarray]:
+           target_res_m: float, resampling: str, check=None) -> tuple[np.ndarray, np.ndarray]:
     """Composite all opened items into one window. Returns (data, valid_mask)."""
     bands = 1 if kind == "elevation" else 3
     out = np.full((bands, height, width), ELEV_NODATA if kind == "elevation" else 0,
@@ -148,6 +179,8 @@ def render(opened: list[Opened], kind: str, transform: Affine, width: int, heigh
     for o in opened:
         if not win_bbox.intersects(o.item.footprint):
             continue
+        if check:  # cancel between items: one slow tile service must not pin the job
+            check()
         ratio = target_res_m / max(o.native_res_m, 1e-9)
         # Charts: sample nearest at up to 4x and box-average -> crisp but not aliased.
         f = int(min(4, max(1, round(ratio)))) if o.mode == "palette" or resampling == "nearest" else 1
@@ -156,7 +189,9 @@ def render(opened: list[Opened], kind: str, transform: Affine, width: int, heigh
         else:
             rs = Resampling.nearest
         if o.ds.driver in ("WMS", "WMTS"):
-            _prefetch(o.ds, win_bbox)
+            _prefetch(o.ds, win_bbox, check)
+            if check:
+                check()
         vt = Affine(transform.a / f, 0, transform.c, 0, transform.e / f, transform.f)
         vrt_kw = dict(crs=WGS84, transform=vt, width=width * f, height=height * f, resampling=rs)
         if o.mode == "elevation":
@@ -191,7 +226,11 @@ def render(opened: list[Opened], kind: str, transform: Affine, width: int, heigh
             else:
                 pm = m
 
-        depth = interior_depth(xs, ys, o.item.footprint).astype(np.float32)
+        fp = o.item.footprint
+        if o.item.clip:
+            pm = pm & _clip_mask(o.item.clip, transform, width, height)
+            fp = _clip_bbox(o.item.clip, fp)
+        depth = interior_depth(xs, ys, fp).astype(np.float32)
         take = pm & (depth > best)
         if take.any():
             out[:, take] = px[:, take]
@@ -243,8 +282,8 @@ def write_geotiff(path: Path, opened: list[Opened], kind: str, grid: Grid, opts:
             for col in range(0, grid.width, BLOCK):
                 ctx.check()
                 w, h = min(BLOCK, grid.width - col), min(BLOCK, grid.height - row)
-                t = grid.transform * Affine.translation(col, row)
-                data, valid = render(opened, kind, t, w, h, target_res, resampling)
+                t = grid.transform @ Affine.translation(col, row)
+                data, valid = render(opened, kind, t, w, h, target_res, resampling, ctx.check)
                 win = Window(col, row, w, h)
                 dst.write(data, window=win)
                 if kind != "elevation":
@@ -305,7 +344,7 @@ def write_dted(out_dir: Path, opened: list[Opened], bbox: BBox, level: int, ctx:
         ctx.check()
         ctx.progress(f"{label}: DTED{level} cell {i}/{len(cells)}", i / len(cells))
         t, nx, ny = dted_cell_grid(la, lo, level)
-        data, valid = render(opened, "elevation", t, nx, ny, t.a * 111_320, "bilinear")
+        data, valid = render(opened, "elevation", t, nx, ny, t.a * 111_320, "bilinear", ctx.check)
         if not valid.any():
             continue
         arr = np.where(valid, np.round(data[0]), ELEV_NODATA).astype(np.int16)
@@ -352,7 +391,9 @@ def build_layer(source: Source, bbox: BBox, lopts: LayerOptions, oopts: OutputOp
         raise ValueError(f"{source.name}: {grid.width}x{grid.height} px at {res_m:g} m exceeds the "
                          f"{ctx.settings.max_pixels:,} pixel limit — use a coarser resolution or smaller area")
     out_dir.mkdir(parents=True, exist_ok=True)
+    # Bounded HTTP timeouts so a dead tile server fails (or is cancelled) promptly.
     env = {"GDAL_CACHEMAX": 512, "GDAL_HTTP_MAX_RETRY": 3, "GDAL_HTTP_RETRY_DELAY": 2,
+           "GDAL_HTTP_TIMEOUT": 60, "GDAL_HTTP_CONNECTTIMEOUT": 15,
            "GDAL_HTTP_USERAGENT": ctx.settings.user_agent}
     for it in items:
         env.update(it.gdal_env)
