@@ -2,6 +2,7 @@
 name = "mapforge"
 version = "0.1.0"
 description = "Self-hosted web tool to fetch, bound and convert aeronautical charts, imagery and elevation into map-engine-ready packages"
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "rasterio>=1.4",

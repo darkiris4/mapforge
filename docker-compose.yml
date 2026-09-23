@@ -1,0 +1,21 @@
+# docker compose up -d   ->  http://<host>:8765
+services:
+  mapforge:
+    build: .
+    image: mapforge:0.1.0
+    container_name: mapforge
+    restart: unless-stopped
+    ports:
+      # Bind to localhost only by default; change to "8765:8765" to serve your LAN
+      # (and set MAPFORGE_TOKEN when you do).
+      - "127.0.0.1:8765:8765"
+    environment:
+      MAPFORGE_WORKERS: "2"
+      MAPFORGE_MAX_PIXELS: "2000000000"
+      # MAPFORGE_TOKEN: "change-me-long-random-string"
+    volumes:
+      - ./data:/data                 # cache, jobs/packages, config (endpoints.json holds credentials)
+      - ./library:/library           # NGA media: CADRG/CIB (A.TOC), ECRG, DTED, NITF, GeoTIFF …
+      # PKI material for controlled endpoints (read-only). Reference these paths in the UI,
+      # e.g. /pki/me.crt.pem, /pki/me.key.pem, /pki/dod-ca-bundle.pem
+      # - ./pki:/pki:ro
