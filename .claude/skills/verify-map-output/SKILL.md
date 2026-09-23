@@ -21,7 +21,8 @@ folder per layer with a `layer.json`. Correctness has two halves, and both matte
     PACKAGE_DIR --sheet /path/to/contact_sheet.png
 ```
 
-It prints one line per file (`OK` / `WARN` / `FAIL`) and exits non-zero on any FAIL. Add
+`PACKAGE_DIR` can also be a single layer folder (one containing `layer.json`) when you only
+changed one source. It prints one line per file (`OK` / `WARN` / `FAIL`) and exits non-zero on any FAIL. Add
 `--json` for machine-readable output. Then open the contact sheet with the Read tool: layers are
 left→right in folder order; elevation is shown as a hillshade.
 
