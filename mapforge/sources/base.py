@@ -7,6 +7,7 @@ a new data provider only needs to know how to find/fetch rasters, never how to m
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -22,6 +23,15 @@ KINDS = ("rgb", "elevation")
 
 class Cancelled(Exception):
     pass
+
+
+_dl_locks: dict[str, threading.Lock] = {}
+_dl_guard = threading.Lock()
+
+
+def _download_lock(dest: Path) -> threading.Lock:
+    with _dl_guard:
+        return _dl_locks.setdefault(str(dest), threading.Lock())
 
 
 @dataclass
@@ -60,7 +70,11 @@ class Auth:
     def gdal_env(self) -> dict[str, str]:
         env: dict[str, str] = {}
         if self.ca_bundle:
+            # rasterio wheels export GDAL_CURL_CA_BUNDLE (certifi) at import, which takes
+            # precedence over GDAL_HTTP_CAINFO — override every spelling so a private/DoD CA is used.
             env["GDAL_HTTP_CAINFO"] = self.ca_bundle
+            env["GDAL_CURL_CA_BUNDLE"] = self.ca_bundle
+            env["CURL_CA_BUNDLE"] = self.ca_bundle
         if self.type == "pki":
             if self.cert:
                 env["GDAL_HTTP_SSLCERT"] = self.cert
@@ -123,25 +137,53 @@ class Context:
         headers = {"User-Agent": self.settings.user_agent, **kw.pop("headers", {})}
         return httpx.Client(timeout=timeout, follow_redirects=True, headers=headers, **kw)
 
-    def download(self, url: str, dest: Path, auth: Auth | None = None, label: str = "") -> Path:
-        """Download to dest (skipped when already cached), reporting progress."""
-        if dest.exists() and dest.stat().st_size > 0:
+    def download(self, url: str, dest: Path, auth: Auth | None = None, label: str = "",
+                 attempts: int = 6) -> Path:
+        """Download to dest (skipped when already cached), reporting progress.
+
+        Stalls and dropped connections are retried with HTTP Range resume, and concurrent
+        jobs fetching the same file wait for one another instead of clobbering the .part file.
+        """
+        with _download_lock(dest):
+            if dest.exists() and dest.stat().st_size > 0:
+                return dest
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dest.with_name(dest.name + ".part")
+            name = label or dest.name
+            timeout = httpx.Timeout(30.0, read=60.0)
+            for attempt in range(attempts):
+                self.check()
+                have = tmp.stat().st_size if tmp.exists() else 0
+                headers = {"Range": f"bytes={have}-"} if have else {}
+                try:
+                    with self.http(auth, timeout=timeout) as c, c.stream("GET", url, headers=headers) as r:
+                        if r.status_code == 416:  # already complete
+                            break
+                        r.raise_for_status()
+                        if have and r.status_code != 206:  # server ignored Range: start over
+                            have = 0
+                        total = have + int(r.headers.get("content-length") or 0)
+                        done, t0, last = have, time.monotonic(), 0.0
+                        with open(tmp, "ab" if have else "wb") as f:
+                            for chunk in r.iter_bytes(1 << 20):
+                                self.check()
+                                f.write(chunk)
+                                done += len(chunk)
+                                now = time.monotonic()
+                                if now - last > 1:
+                                    last = now
+                                    rate = (done - have) / max(now - t0, 1e-3) / 1e6
+                                    size = f"{done / 1e6:.0f}/{total / 1e6:.0f} MB" if total > have else f"{done / 1e6:.0f} MB"
+                                    self.progress(f"Downloading {name} ({size}, {rate:.1f} MB/s)", None)
+                    if total <= have or tmp.stat().st_size >= total:
+                        break
+                except (httpx.TransportError, httpx.RemoteProtocolError) as e:
+                    if attempt == attempts - 1:
+                        raise RuntimeError(f"Download of {name} failed after {attempts} attempts: {e}") from e
+                    self.progress(f"Downloading {name}: connection problem ({type(e).__name__}), resuming…", None)
+                    time.sleep(min(30, 2 * 2**attempt))
+            tmp.replace(dest)
             return dest
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        tmp = dest.with_name(dest.name + ".part")
-        with self.http(auth, timeout=120) as c, c.stream("GET", url) as r:
-            r.raise_for_status()
-            total = int(r.headers.get("content-length") or 0)
-            done = 0
-            with open(tmp, "wb") as f:
-                for chunk in r.iter_bytes(1 << 20):
-                    self.check()
-                    f.write(chunk)
-                    done += len(chunk)
-                    if total:
-                        self.progress(f"Downloading {label or dest.name} ({done >> 20}/{total >> 20} MB)", None)
-        tmp.replace(dest)
-        return dest
 
 
 class Source:

@@ -14,7 +14,7 @@ from xml.sax.saxutils import escape
 
 import httpx
 
-from ..geo import BBox, meters_to_deg, web_mercator_res
+from ..geo import BBox, meters_to_deg, web_mercator_res, web_mercator_zoom_for
 from .base import Auth, Context, Item, Source
 
 MERC = 20037508.342789244
@@ -37,6 +37,9 @@ class CopernicusDEM(Source):
         self.default_res_m = 30.0 if arcsec == 30 else 90.0
         self.min_res_m = self.default_res_m
         self.bucket = "copernicus-dem-30m" if arcsec == 30 else "copernicus-dem-90m"
+        # Tiles at least this fraction covered by the area are downloaded and cached; less
+        # than that are read remotely (cloud-optimised GeoTIFF window reads).
+        self.DOWNLOAD_FRACTION = 0.25
         self.code = "10" if arcsec == 30 else "30"
 
     def tile_url(self, lat: int, lon: int) -> str:
@@ -60,11 +63,20 @@ class CopernicusDEM(Source):
         cache = ctx.settings.cache_dir / "dem" / self.id
         out = []
         for i, (lat, lon) in enumerate(sorted(present), 1):
-            ctx.progress(f"{self.name}: tile {i}/{len(present)}", None)
             url = self.tile_url(lat, lon)
-            local = ctx.download(url, cache / url.rsplit("/", 1)[1], label=f"DEM tile {i}/{len(present)}")
-            out.append(Item(path=str(local), footprint=BBox(lon, lat, lon + 1, lat + 1),
-                            label=f"{url.rsplit('/', 1)[1]}", native_res_m=self.default_res_m))
+            fp = BBox(lon, lat, lon + 1, lat + 1)
+            local = cache / url.rsplit("/", 1)[1]
+            touched = bbox.intersection(fp)
+            frac = ((touched.east - touched.west) * (touched.north - touched.south)) if touched else 0.0
+            if local.exists() or frac >= self.DOWNLOAD_FRACTION:
+                # Mostly-covered tiles are fetched once and cached for later jobs.
+                ctx.progress(f"{self.name}: tile {i}/{len(present)}", None)
+                path = str(ctx.download(url, local, label=f"DEM tile {i}/{len(present)}"))
+            else:
+                # Small overlap: read just the needed window of the COG over HTTP.
+                path = f"/vsicurl/{url}"
+            out.append(Item(path=path, footprint=fp, label=url.rsplit("/", 1)[1], native_res_m=self.default_res_m,
+                            gdal_env={"GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR"}))
         return out
 
 
@@ -169,7 +181,9 @@ class TileService(Source):
 
     def _xyz_xml(self, ctx: Context) -> str:
         url = self.url.replace("{z}", "${z}").replace("{x}", "${x}").replace("{y}", "${y}")
-        bands = 1 if self.kind == "elevation" else 3
+        # RGB + alpha: GDAL marks missing (404/204) tiles transparent instead of black, so gaps
+        # in a service never masquerade as valid pixels in the mosaic.
+        bands = 1 if self.kind == "elevation" else 4
         return f"""<GDAL_WMS>
   <Service name="TMS"><ServerUrl>{escape(url)}</ServerUrl></Service>
   <DataWindow><UpperLeftX>{-MERC}</UpperLeftX><UpperLeftY>{MERC}</UpperLeftY>
@@ -191,7 +205,7 @@ class TileService(Source):
   <DataWindow><UpperLeftX>{bbox.west}</UpperLeftX><UpperLeftY>{bbox.north}</UpperLeftY>
     <LowerRightX>{bbox.east}</LowerRightX><LowerRightY>{bbox.south}</LowerRightY>
     <SizeX>{w}</SizeX><SizeY>{h}</SizeY></DataWindow>
-  <Projection>EPSG:4326</Projection><BlockSizeX>1024</BlockSizeX><BlockSizeY>1024</BlockSizeY><BandsCount>3</BandsCount>
+  <Projection>EPSG:4326</Projection><BlockSizeX>1024</BlockSizeX><BlockSizeY>1024</BlockSizeY><BandsCount>{1 if self.kind == "elevation" else 4}</BandsCount>
   <MaxConnections>4</MaxConnections><Timeout>120</Timeout><UserAgent>{escape(ctx.settings.user_agent)}</UserAgent>
   <Cache><Path>{self._cache(ctx)}</Path></Cache>
 </GDAL_WMS>"""
@@ -203,15 +217,66 @@ class TileService(Source):
                 opts.append(f"tilematrixset={self.tile_matrix_set}")
             path = "WMTS:" + ",".join([self.url, *opts])
             env = {**self.auth.gdal_env(), "GDAL_DEFAULT_WMS_CACHE_PATH": str(self._cache(ctx))}
+            # No probe: opening a WMTS dataset already fetches GetCapabilities, so a bad URL or
+            # credential fails immediately when the layer is opened for rendering.
             return [Item(path=path, footprint=bbox, label=self.name, gdal_env=env)]
         if self.service == "wms":
             xml = self._wms_xml(bbox, res_m, ctx)
         else:
+            self._probe_xyz(bbox, res_m, ctx)
             xml = self._xyz_xml(ctx)
         p = self._cache(ctx) / f"{hashlib.sha1(xml.encode()).hexdigest()[:16]}.xml"
         p.write_text(xml)
         # native_res_m=None: the tile pyramid's finest zoom is not the data's true resolution.
-        return [Item(path=str(p), footprint=bbox, label=self.name, gdal_env=self.auth.gdal_env())]
+        item = Item(path=str(p), footprint=bbox, label=self.name, gdal_env=self.auth.gdal_env())
+        if self.service == "wms":
+            self._probe_gdal(item, read=True)
+        return [item]
+
+    # -- fail-fast probes: a wrong URL, bad credentials or an empty area should produce a clear
+    #    error in seconds, not a long render of blank tiles. ---------------------------------
+    def _probe_xyz(self, bbox: BBox, res_m: float, ctx: Context) -> None:
+        z = min(self.max_zoom, web_mercator_zoom_for(max(res_m, 0.05), bbox.center_lat))
+        pts = {(bbox.west + (bbox.east - bbox.west) * fx, bbox.south + (bbox.north - bbox.south) * fy)
+               for fx, fy in ((0.5, 0.5), (0.1, 0.1), (0.9, 0.9), (0.1, 0.9), (0.9, 0.1))}
+        tiles = sorted({_lonlat_to_tile(lon, lat, z) for lon, lat in pts})
+        statuses = []
+        try:
+            with ctx.http(self.auth, timeout=30) as c:
+                for x, y in tiles:
+                    url = self.url.replace("{z}", str(z)).replace("{x}", str(x)).replace("{y}", str(y))
+                    r = c.get(url)
+                    ctype = r.headers.get("content-type", "")
+                    if r.status_code == 200 and ("image" in ctype or r.content[:4] in (b"\x89PNG", b"\xff\xd8\xff\xe0",
+                                                                                       b"\xff\xd8\xff\xe1", b"\xff\xd8\xff\xdb")):
+                        return
+                    if r.status_code in (401, 403):
+                        raise PermissionError(f"{self.name}: server rejected the request (HTTP {r.status_code}) — "
+                                              "check credentials / certificate")
+                    statuses.append(r.status_code if r.status_code != 200 else f"200 {ctype or 'non-image'}")
+        except httpx.HTTPError as e:
+            raise RuntimeError(f"{self.name}: cannot reach tile server: {e}") from e
+        raise ValueError(f"{self.name}: no tiles for this area at zoom {z} (got {', '.join(map(str, statuses))}) — "
+                         "check the URL template / layer, or the service has no coverage here")
+
+    def _probe_gdal(self, item: Item, read: bool = False) -> None:
+        import rasterio
+        from rasterio.windows import Window
+
+        try:
+            with rasterio.Env(GDAL_HTTP_TIMEOUT=30, GDAL_HTTP_MAX_RETRY=1, **item.gdal_env), rasterio.open(item.path) as ds:
+                if read:
+                    ds.read(1, window=Window(0, 0, min(64, ds.width), min(64, ds.height)))
+        except Exception as e:
+            raise RuntimeError(f"{self.name}: service check failed — {str(e)[:300]}") from e
+
+
+def _lonlat_to_tile(lon: float, lat: float, z: int) -> tuple[int, int]:
+    n = 2**z
+    lat = max(min(lat, 85.0511), -85.0511)
+    x = int((lon + 180.0) / 360.0 * n)
+    y = int((1.0 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2.0 * n)
+    return min(max(x, 0), n - 1), min(max(y, 0), n - 1)
 
 
 # --------------------------------------------------------------------------------------
@@ -238,7 +303,9 @@ def public_service_sources() -> list[Source]:
             license="USGS The National Map, public domain."),
         *[TileService(
             f"s2cloudless-{yr}", f"Sentinel-2 cloudless {yr} (10 m, global)",
-            f"https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-{yr}_3857/default/g/{{z}}/{{y}}/{{x}}.jpg",
+            # EOX publishes the original 2016 mosaic as "s2cloudless", later years as "s2cloudless-YYYY".
+            f"https://tiles.maps.eox.at/wmts/1.0.0/{'s2cloudless' if yr == '2016' else 's2cloudless-' + yr}_3857"
+            "/default/g/{z}/{y}/{x}.jpg",
             img, max_zoom=15, default_res_m=10.0,
             description="Cloud-free global Sentinel-2 mosaic by EOX. Good worldwide 10 m base layer.",
             license=("CC BY 4.0 — 'Sentinel-2 cloudless by EOX IT Services GmbH (contains modified Copernicus "
