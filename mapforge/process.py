@@ -60,11 +60,30 @@ class Opened:
     bands: list[int] = field(default_factory=list)
 
 
-def _native_res_m(ds) -> float:
+def _is_mercator(crs) -> bool:
+    if not crs or not crs.is_projected:
+        return False
+    if crs.to_epsg() in (3857, 3395, 900913, 3785):
+        return True
+    wkt = crs.to_wkt()
+    return "Mercator" in wkt and "Transverse" not in wkt
+
+
+def _native_res_m(ds, lat: float | None = None) -> float:
+    """Ground resolution in metres at `lat` (default: the dataset centre)."""
     a = abs(ds.transform.a)
     if ds.crs and ds.crs.is_geographic:
-        lat = (ds.bounds.top + ds.bounds.bottom) / 2
+        if lat is None:
+            lat = (ds.bounds.top + ds.bounds.bottom) / 2
         return a * 111_320 * max(math.cos(math.radians(lat)), 0.1)
+    if _is_mercator(ds.crs):
+        # Mercator metres are stretched by 1/cos(lat): a z15 tile pixel is 4.8 m "map" but
+        # only ~3.7 m on the ground at 39N.  Without this, tile zooms come out a level too fine.
+        if lat is None:
+            from rasterio.warp import transform_bounds
+            b = transform_bounds(ds.crs, "EPSG:4326", *ds.bounds)
+            lat = (b[1] + b[3]) / 2
+        return a * max(math.cos(math.radians(lat)), 0.01)
     return a
 
 
@@ -72,7 +91,7 @@ def open_item(item: Item, kind: str, target_res_m: float, stack: ExitStack) -> O
     ds = stack.enter_context(rasterio.open(item.path))
     if ds.crs is None:
         return None
-    native = _native_res_m(ds)
+    native = _native_res_m(ds, item.footprint.center_lat)
     # Use the coarsest overview (or tile zoom level) that is still at least as fine as the
     # target — crucial for tile services, whose full-resolution level may be zoom 19+.
     ovs = ds.overviews(1) if ds.count else []
@@ -334,6 +353,27 @@ def dted_cell_grid(lat: int, lon: int, level: int) -> tuple[Affine, int, int]:
     return Affine(dx, 0, lon - dx / 2, 0, -dy, lat + 1 + dy / 2), nx, ny
 
 
+DTED_SPACING_M = {0: 900.0, 1: 90.0, 2: 30.0}
+
+
+def _dted_bbox(bbox: BBox) -> BBox:
+    """Whole-degree cells covering bbox, plus the half-post margin DTED edge posts need."""
+    m = 0.005
+    return BBox(max(-180.0, math.floor(bbox.west) - m), max(-90.0, math.floor(bbox.south) - m),
+                min(180.0, math.ceil(bbox.east) + m), min(90.0, math.ceil(bbox.north) + m))
+
+
+def _covers(footprints: list[BBox], target: BBox, n: int = 21) -> bool:
+    """True if the footprints jointly cover target (checked on an n x n point lattice)."""
+    xs = np.linspace(target.west, target.east, n)
+    ys = np.linspace(target.south, target.north, n)
+    for x in xs:
+        for y in ys:
+            if not any(f.west <= x <= f.east and f.south <= y <= f.north for f in footprints):
+                return False
+    return True
+
+
 def write_dted(out_dir: Path, opened: list[Opened], bbox: BBox, level: int, ctx: Context, label: str) -> list[str]:
     """Write standard DTED cells (dted/<wNNN>/<nNN>.dtL) covering bbox, complete 1° cells."""
     files = []
@@ -424,7 +464,18 @@ def build_layer(source: Source, bbox: BBox, lopts: LayerOptions, oopts: OutputOp
             else:
                 tif.unlink()
         if source.kind == "elevation" and oopts.dted_level is not None:
-            result["files"] += write_dted(out_dir, opened, bbox, int(oopts.dted_level), ctx, source.name)
+            level = int(oopts.dted_level)
+            dted_bbox = _dted_bbox(bbox)
+            dted_opened = opened
+            if not _covers([i.footprint for i in items], dted_bbox):
+                # Service sources (ImageServer, WMS, tiles) only returned the job area; DTED
+                # cells are whole degrees, so fetch the expanded area at DTED post spacing.
+                ctx.progress(f"{source.name}: fetching whole-degree area for DTED{level}", None)
+                spacing_m = DTED_SPACING_M[level]
+                d_items = source.items(dted_bbox, max(spacing_m, getattr(source, "min_res_m", 0) or 0), ctx)
+                with rasterio.Env(**{k: v for i in d_items for k, v in i.gdal_env.items()}):
+                    dted_opened = [o for o in (open_item(i, source.kind, spacing_m, stack) for i in d_items) if o]
+            result["files"] += write_dted(out_dir, dted_opened, bbox, level, ctx, source.name)
     for aux in out_dir.glob("*.aux.xml"):
         aux.unlink()
     result["status"] = "ok"

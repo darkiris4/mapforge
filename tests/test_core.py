@@ -206,3 +206,43 @@ def test_render_honours_cancel(settings, tmp_path):
         o = open_item(item, "rgb", 1000, st)
         with pytest.raises(sources.Cancelled):
             render([o], "rgb", from_bounds(0, 0, 1, 1, 64, 64), 64, 64, 1000, "nearest", ctx.check)
+
+
+class BBoxOnlyDEM(sources.Source):
+    """Mimics an ImageServer/WMS elevation source: returns data for exactly the bbox asked."""
+
+    def __init__(self, tmp):
+        self.tmp, self.kind, self.resampling = tmp, "elevation", "bilinear"
+        self.id, self.name, self.default_res_m, self.min_res_m = "svc", "Service DEM", 1000.0, 10.0
+        self.calls = []
+
+    def items(self, bbox, res_m, ctx):
+        self.calls.append(bbox)
+        p = self.tmp / f"svc_{len(self.calls)}.tif"
+        write_dem(p, bbox.as_tuple(), size=200)
+        return [sources.Item(path=str(p), footprint=bbox)]
+
+
+def test_dted_from_service_source_fetches_whole_cells(settings, tmp_path):
+    src = BBoxOnlyDEM(tmp_path)
+    res = build_layer(src, BBox(-77.6, 38.2, -77.4, 38.4), LayerOptions(res_m=1000),
+                      OutputOptions(geotiff=False, dted_level=0), tmp_path / "out", Context(settings), "svc")
+    assert res["files"] == ["dted/w078/n38.dt0"]
+    assert len(src.calls) == 2  # job area, then the whole-degree DTED area
+    exp = src.calls[1]
+    assert exp.west < -78 and exp.east > -77 and exp.south < 38 and exp.north > 39
+    with rasterio.open(tmp_path / "out" / "dted/w078/n38.dt0") as ds:
+        assert (ds.read(1) != -32767).all(), "DTED cell has voids"
+
+
+def test_mercator_native_resolution():
+    from mapforge.process import _native_res_m
+
+    p = Path("/tmp/mapforge-merc-test.tif")
+    with rasterio.open(p, "w", driver="GTiff", width=10, height=10, count=1, dtype="uint8", crs="EPSG:3857",
+                       transform=from_bounds(0, 8_000_000, 100, 8_000_100, 10, 10)) as ds:
+        ds.write(np.zeros((1, 10, 10), np.uint8))
+    with rasterio.open(p) as ds:
+        assert _native_res_m(ds, 60.0) == pytest.approx(5.0, rel=1e-3)  # 10 m Mercator at 60N
+        assert _native_res_m(ds, 0.0) == pytest.approx(10.0)
+    p.unlink()
