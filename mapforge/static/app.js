@@ -506,9 +506,10 @@ $("#rescanBtn").addEventListener("click", async () => { await api("/api/library/
 $("#uploadFile").addEventListener("change", (e) => {
   const file = e.target.files[0]; if (!file) return;
   const st = $("#libStatus"), bar = $("#uploadBar");
-  const fd = new FormData(); fd.append("file", file);
   const xhr = new XMLHttpRequest();
-  xhr.open("POST", "/api/library/upload");
+  // Raw streaming PUT: the server writes straight into the library (no /tmp copy).
+  xhr.open("PUT", "/api/library/upload?filename=" + encodeURIComponent(file.name));
+  xhr.setRequestHeader("Content-Type", "application/octet-stream");
   if (token) xhr.setRequestHeader("X-MapForge-Token", token);
   st.dataset.uploading = "1"; bar.classList.remove("hidden");
   xhr.upload.onprogress = (ev) => {
@@ -522,7 +523,7 @@ $("#uploadFile").addEventListener("change", (e) => {
     if (xhr.status >= 200 && xhr.status < 300) { st.textContent = `Uploaded ${file.name}; scanning…`; libWasRunning = true; loadLibrary(); }
     else { let m = xhr.statusText || "network error"; try { m = JSON.parse(xhr.responseText).detail; } catch (_) {} st.textContent = "Upload failed: " + m; }
   };
-  xhr.send(fd);
+  xhr.send(file);
 });
 
 // ---------------------------------------------------------------------------------- boot

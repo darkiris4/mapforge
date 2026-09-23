@@ -22,6 +22,8 @@ from .sources.custom import PRESETS, TYPES, endpoint_to_source
 from .sources.local import scan
 
 STATIC = Path(__file__).parent / "static"
+MAX_ARCHIVE_MEMBERS = 200_000
+MIN_FREE_BYTES = 512 << 20  # keep this much free on the library disk
 
 
 LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "[::1]", "::1"}
@@ -222,16 +224,15 @@ def create_app(settings: Settings | None = None, allowed_hosts: set[str] | None 
             threading.Thread(target=_rescan, daemon=True).start()
         return scan_state
 
-    @app.post("/api/library/upload")
-    def upload(file: UploadFile = File(...)):
-        """Upload NGA media (zip/tar of an RPF tree, DTED, NITF, GeoTIFF …) into the library."""
-        name = SAFE_NAME.sub("_", Path(file.filename or "upload").name).strip(" .") or "upload"
+    def _check_space(total: int, what: str) -> None:
+        free = shutil.disk_usage(s.library_dirs[0]).free
+        if total + MIN_FREE_BYTES > free:
+            raise HTTPException(507, f"{what} needs {total / 1e9:.1f} GB but only {free / 1e9:.1f} GB is free "
+                                     f"on the library disk (keeping {MIN_FREE_BYTES / 1e9:.1f} GB spare)")
+
+    def _ingest(tmp: Path, name: str) -> None:
+        """Move an uploaded file into the library, extracting archives safely."""
         lib = s.library_dirs[0]
-        staging = lib / ".incoming"
-        staging.mkdir(parents=True, exist_ok=True)
-        tmp = staging / (name + ".part")
-        with open(tmp, "wb") as f:
-            shutil.copyfileobj(file.file, f, 1 << 20)
         lower = name.lower()
         try:
             if lower.endswith((".zip", ".tar", ".tar.gz", ".tgz")):
@@ -241,13 +242,24 @@ def create_app(settings: Settings | None = None, allowed_hosts: set[str] | None 
                 target = lib / stem
                 if lower.endswith(".zip"):
                     with zipfile.ZipFile(tmp) as z:
-                        for m in z.namelist():
-                            if Path(m).is_absolute() or ".." in Path(m).parts or ":" in m.split("/")[0]:
+                        infos = z.infolist()
+                        for m in infos:
+                            if Path(m.filename).is_absolute() or ".." in Path(m.filename).parts \
+                                    or ":" in m.filename.split("/")[0]:
                                 raise HTTPException(400, "archive contains unsafe paths")
+                        if len(infos) > MAX_ARCHIVE_MEMBERS:
+                            raise HTTPException(400, f"archive has {len(infos):,} entries (limit {MAX_ARCHIVE_MEMBERS:,})")
+                        # zipfile never inflates a member past its declared size, so the declared
+                        # total bounds what extraction can write (defeats zip bombs).
+                        _check_space(sum(m.file_size for m in infos), "Extracting this archive")
                         target.mkdir(exist_ok=True)
                         z.extractall(target)
                 else:
                     with tarfile.open(tmp) as t:
+                        members = t.getmembers()
+                        if len(members) > MAX_ARCHIVE_MEMBERS:
+                            raise HTTPException(400, f"archive has {len(members):,} entries (limit {MAX_ARCHIVE_MEMBERS:,})")
+                        _check_space(sum(m.size for m in members if m.isfile()), "Extracting this archive")
                         target.mkdir(exist_ok=True)
                         t.extractall(target, filter="data")
             else:
@@ -258,6 +270,49 @@ def create_app(settings: Settings | None = None, allowed_hosts: set[str] | None 
         finally:
             tmp.unlink(missing_ok=True)
         rescan()
+
+    def _staging(name: str) -> Path:
+        staging = s.library_dirs[0] / ".incoming"
+        staging.mkdir(parents=True, exist_ok=True)
+        return staging / f"{secrets.token_hex(4)}_{name}.part"
+
+    def _safe_upload_name(raw: str | None) -> str:
+        return SAFE_NAME.sub("_", Path(raw or "upload").name).strip(" .") or "upload"
+
+    @app.put("/api/library/upload")
+    async def upload_stream(request: Request, filename: str):
+        """Stream a raw request body straight into the library (no temp copy in /tmp) —
+        preferred for multi-GB NGA archives. Used by the web UI."""
+        from starlette.concurrency import run_in_threadpool
+
+        name = _safe_upload_name(filename)
+        declared = int(request.headers.get("content-length") or 0)
+        if declared:
+            _check_space(declared, "This upload")
+        tmp = _staging(name)
+        written = 0
+        try:
+            with open(tmp, "wb") as f:
+                async for chunk in request.stream():
+                    f.write(chunk)
+                    written += len(chunk)
+                    if written % (256 << 20) < len(chunk):  # re-check headroom every ~256 MB
+                        _check_space(0, "Continuing this upload")
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
+        await run_in_threadpool(_ingest, tmp, name)
+        return {"ok": True, "bytes": written}
+
+    @app.post("/api/library/upload")
+    def upload(file: UploadFile = File(...)):
+        """Multipart upload (kept for scripts/curl -F). Starlette spools the body to a temp
+        file first; the web UI uses the streaming PUT above instead."""
+        name = _safe_upload_name(file.filename)
+        tmp = _staging(name)
+        with open(tmp, "wb") as f:
+            shutil.copyfileobj(file.file, f, 1 << 20)
+        _ingest(tmp, name)
         return {"ok": True}
 
     @app.get("/api/info")

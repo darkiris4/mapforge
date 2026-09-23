@@ -102,3 +102,42 @@ def test_cannot_delete_running_job_and_validation(client, settings):
     assert client.post("/api/estimate", json=bad).status_code == 400
     bad["layers"] = [{"source": "faa-heli", "res_m": -5}]
     assert client.post("/api/estimate", json=bad).status_code == 400
+
+
+def _zip_bytes(members: dict[str, bytes]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for n, data in members.items():
+            z.writestr(n, data)
+    return buf.getvalue()
+
+
+def test_streaming_put_upload_extracts_without_tmp_copy(client, settings):
+    body = _zip_bytes({"imgs/readme.txt": b"hello"})
+    r = client.put("/api/library/upload", params={"filename": "../../My NGA disc.zip"}, content=body,
+                   headers={"content-type": "application/octet-stream"})
+    assert r.status_code == 200 and r.json()["bytes"] == len(body)
+    lib = settings.library_dirs[0]
+    assert (lib / "My NGA disc" / "imgs" / "readme.txt").read_bytes() == b"hello"
+    assert not any((lib / ".incoming").iterdir())  # staging cleaned up
+
+
+def test_archive_larger_than_free_space_is_refused(client, settings, monkeypatch):
+    # A 64 MB zero-filled member compresses to ~64 KB: the zip-bomb shape.
+    body = _zip_bytes({"bomb.bin": b"\0" * (64 << 20)})
+    assert len(body) < 1 << 20
+    import collections
+    import shutil as _sh
+
+    fake = collections.namedtuple("usage", "total used free")
+    monkeypatch.setattr(_sh, "disk_usage", lambda p: fake(1 << 40, 0, 560 << 20))  # 560 MB free: upload fits, 64 MB inflate + 512 MB reserve does not
+    r = client.put("/api/library/upload", params={"filename": "bomb.zip"}, content=body)
+    assert r.status_code == 507 and "free" in r.json()["detail"]
+    lib = settings.library_dirs[0]
+    assert not (lib / "bomb").exists() and not any((lib / ".incoming").iterdir())
+
+
+def test_cross_site_put_upload_refused(client):
+    r = client.put("/api/library/upload", params={"filename": "x.zip"}, content=b"PK",
+                   headers={"origin": "http://evil.example"})
+    assert r.status_code == 403
