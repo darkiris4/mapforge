@@ -1,0 +1,29 @@
+[project]
+name = "mapforge"
+version = "0.1.0"
+description = "Self-hosted web tool to fetch, bound and convert aeronautical charts, imagery and elevation into map-engine-ready packages"
+requires-python = ">=3.10"
+dependencies = [
+  "rasterio>=1.4",
+  "numpy>=1.26",
+  "fastapi>=0.110",
+  "uvicorn>=0.29",
+  "httpx>=0.27",
+  "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+mapforge = "mapforge.app:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["mapforge*"]
+
+[tool.setuptools.package-data]
+mapforge = ["static/**/*"]
