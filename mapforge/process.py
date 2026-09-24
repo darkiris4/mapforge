@@ -11,12 +11,14 @@ import math
 import os
 import re
 import shutil
+import time
 from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
 import rasterio
+import rasterio.errors
 import rasterio.shutil
 from rasterio.crs import CRS
 from rasterio.enums import ColorInterp, MaskFlags, Resampling
@@ -184,6 +186,53 @@ def _clip_bbox(polys, fp: BBox) -> BBox:
 # --------------------------------------------------------------------------------------
 # Rendering one grid window
 # --------------------------------------------------------------------------------------
+# Transient network failures from tile/WMS servers (a dropped connection, a timeout, a 5xx)
+# surface as a RasterioIOError on read. GDAL only retries HTTP error codes itself, not a reset
+# connection (verified in tests/test_resilience.py), and it keeps every tile it already fetched in
+# its on-disk cache, so retrying the read re-downloads only what is missing.
+NET_RETRY_DELAYS_S = (2, 5, 15, 30)
+_NET_ERR = re.compile(r"Unable to download block|Recv failure|Connection reset|Connection refused|"
+                      r"timed out|Timeout was reached|Couldn't connect|Empty reply|SSL|"
+                      r"HTTP status code: 5\d\d|Operation too slow", re.I)
+
+
+class ServerDroppedError(RuntimeError):
+    """A map server kept failing after all retries; message is written for end users."""
+
+
+def _is_network_error(e: BaseException) -> bool:
+    while e is not None:
+        if _NET_ERR.search(str(e)):
+            return True
+        e = e.__cause__ or e.__context__
+    return False
+
+
+def read_with_retry(fn, check=None, what: str = "map server", note=None, delays=None):
+    """Run a rasterio read, retrying transient network errors with cancellable back-off."""
+    delays = NET_RETRY_DELAYS_S if delays is None else delays
+    last = None
+    for attempt, delay in enumerate((0, *delays)):
+        if delay:
+            if note:
+                note(f"{what}: connection dropped — retrying ({attempt}/{len(delays)})")
+            end = time.monotonic() + delay
+            while time.monotonic() < end:
+                if check:
+                    check()
+                time.sleep(min(0.5, max(0.0, end - time.monotonic())))
+        try:
+            return fn()
+        except rasterio.errors.RasterioIOError as e:
+            if not _is_network_error(e):
+                raise
+            last = e
+    raise ServerDroppedError(
+        f"The {what} kept dropping the connection while downloading ({len(delays) + 1} tries). "
+        "Everything already downloaded is kept — run the job again to continue from where it stopped."
+    ) from last
+
+
 def render(opened: list[Opened], kind: str, transform: Affine, width: int, height: int,
            target_res_m: float, resampling: str, check=None) -> tuple[np.ndarray, np.ndarray]:
     """Composite all opened items into one window. Returns (data, valid_mask)."""
@@ -220,13 +269,15 @@ def render(opened: list[Opened], kind: str, transform: Affine, width: int, heigh
                           nodata=ELEV_NODATA, dtype="float32")
         elif o.alpha_band is None:
             vrt_kw["add_alpha"] = True
-        with WarpedVRT(o.ds, **vrt_kw) as vrt:
-            data = vrt.read(o.bands)
-            if o.mode == "elevation":
-                m = (data[0] != ELEV_NODATA) & np.isfinite(data[0])
-            else:
+        def read_window():
+            with WarpedVRT(o.ds, **vrt_kw) as vrt:
+                data = vrt.read(o.bands)
+                if o.mode == "elevation":
+                    return data, (data[0] != ELEV_NODATA) & np.isfinite(data[0])
                 ab = o.alpha_band if o.alpha_band is not None else vrt.count
-                m = vrt.read(ab) > 0
+                return data, vrt.read(ab) > 0
+
+        data, m = read_with_retry(read_window, check, o.item.label or "map server")
 
         if o.mode == "elevation":
             px, pm = data.astype(np.float32), m
@@ -671,9 +722,12 @@ def write_clip(ds, bbox: BBox, dst_path: Path, ctx: Context, is_service: bool = 
             h = min(rows, height - r)
             src_win = Window(win.col_off, win.row_off + r, width, h)
             dst_win = Window(0, r, width, h)
-            dst.write(ds.read(bands, window=src_win), window=dst_win)
+            what = "map server" if is_service else "source file"
+            dst.write(read_with_retry(lambda: ds.read(bands, window=src_win), ctx.check, what,
+                                      lambda m: ctx.progress(m, None)), window=dst_win)
             if mask_from:
-                m = ds.read(alpha, window=src_win) if mask_from == "alpha" else ds.read_masks(1, window=src_win)
+                m = read_with_retry(lambda: ds.read(alpha, window=src_win) if mask_from == "alpha"
+                                    else ds.read_masks(1, window=src_win), ctx.check, what)
                 dst.write_mask(np.where(m > 0, 255, 0).astype(np.uint8), window=dst_win)
             ctx.progress(f"Cutting {dst_path.name}", (r + h) / height)
         factors = _overview_factors(width, height)

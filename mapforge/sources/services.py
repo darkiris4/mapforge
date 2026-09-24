@@ -465,13 +465,23 @@ class TileService(Source):
         pts = {(bbox.west + (bbox.east - bbox.west) * fx, bbox.south + (bbox.north - bbox.south) * fy)
                for fx, fy in ((0.5, 0.5), (0.1, 0.1), (0.9, 0.9), (0.1, 0.9), (0.9, 0.1))}
         tiles = sorted({_lonlat_to_tile(lon, lat, z) for lon, lat in pts})
-        statuses = []
-        try:
+        statuses, dropped = [], []
+        # A dropped connection on one probe tile says nothing about the service; try the other
+        # tiles, and give the whole probe a second chance before calling the server unreachable.
+        for attempt in range(2):
+            if attempt:
+                ctx.cancel_event.wait(3)
+                ctx.check()
+            statuses, dropped = [], []
             with ctx.http(self.auth, timeout=30) as c:
                 for x, y in tiles:
                     url = self.url.replace("{z}", str(z)).replace("{x}", str(x)).replace("{y}", str(y))
                     t0 = time.monotonic()
-                    r = c.get(url)
+                    try:
+                        r = c.get(url)
+                    except httpx.TransportError as e:
+                        dropped.append(e)
+                        continue
                     ctype = r.headers.get("content-type", "")
                     if r.status_code == 200 and ("image" in ctype or r.content[:4] in (b"\x89PNG", b"\xff\xd8\xff\xe0",
                                                                                        b"\xff\xd8\xff\xe1", b"\xff\xd8\xff\xdb")):
@@ -484,8 +494,11 @@ class TileService(Source):
                         raise PermissionError(f"{self.name}: server rejected the request (HTTP {r.status_code}) — "
                                               "check credentials / certificate")
                     statuses.append(r.status_code if r.status_code != 200 else f"200 {ctype or 'non-image'}")
-        except httpx.HTTPError as e:
-            raise RuntimeError(f"{self.name}: cannot reach tile server: {e}") from e
+            if statuses:  # the server answered; retrying won't change a 404 into a tile
+                break
+        if dropped and not statuses:
+            raise RuntimeError(f"{self.name}: cannot reach the tile server ({type(dropped[-1]).__name__}: "
+                               f"{dropped[-1]}) — check the network, or try again in a few minutes") from dropped[-1]
         raise ValueError(f"{self.name}: no tiles for this area at zoom {z} (got {', '.join(map(str, statuses))}) — "
                          "check the URL template / layer, or the service has no coverage here")
 
