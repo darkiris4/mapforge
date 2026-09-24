@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .geo import BBox, grid_for
-from .process import LayerOptions, OutputOptions, build_layer
+from .process import MODES, LayerOptions, OutputOptions, build_layer
 from .settings import Settings
 from .sources import Cancelled, Context, registry
 
@@ -22,6 +22,27 @@ PX_M = 0.0002645833
 # Observed throughput of USGS ImageServer exports (2000x2000 px, 4 in parallel): ~2 per minute.
 EXPORT_CHUNKS_PER_MIN = 2.0
 JOB_ID_RE = re.compile(r"\d{8}-\d{6}-[0-9a-f]{6}")
+
+# Plain-language explanation of each output mode: (short title, README paragraph lines).
+MODE_TEXT = {
+    "kongsberg": ("Kongsberg-ready (converted)", [
+        "Every layer was merged into one seamless raster per source and reprojected to WGS84",
+        "latitude/longitude (EPSG:4326), with overviews, ready to load into Kongsberg TerraLens."]),
+    "clipped": ("Clipped, not converted", [
+        "Each source file was cut to your area and otherwise left as it was: its own map projection,",
+        "its own colours/palette and data type (elevation stays in metres). Nothing was merged or",
+        "reprojected, so files from different sources do not line up pixel-for-pixel, and FAA chart",
+        "borders and legends (collars) are still present. Each cut file is lossless unless its source",
+        "was already JPEG-compressed imagery, and has internal overviews so it zooms out quickly.",
+        "Use this with GIS tools that handle projections themselves; choose 'Kongsberg-ready' for",
+        "TerraLens."]),
+    "original": ("Original files, untouched", [
+        "The source files exactly as their publishers distribute them: whole files, NOT cut to your",
+        "area, so they usually cover much more ground than you selected, together with the files",
+        "that belong with them (world files, metadata). Map services that don't publish files",
+        "(tile/WMS/WMTS services) were cut to your area in the service's own projection instead.",
+        "Use this for archiving, or to hand data to other GIS software unchanged."]),
+}
 
 
 def _safe(s: str) -> str:
@@ -74,12 +95,17 @@ class JobManager:
             seen.add(layer["source"])
             if layer.get("res_m") not in (None, "") and not float(layer["res_m"]) > 0:
                 raise ValueError(f"{reg[layer['source']].name}: resolution must be a positive number of metres")
+        mode = spec.get("mode") or "kongsberg"
+        if mode not in MODES:
+            raise ValueError(f"Unknown output mode {mode!r} — choose one of: {', '.join(MODES)}")
         o = spec.get("outputs") or {}
         outputs = OutputOptions(geotiff=o.get("geotiff", True), cog=o.get("cog", False),
                                 mbtiles=o.get("mbtiles", False),
                                 dted_level=None if o.get("dted_level") in (None, "", "none") else int(o["dted_level"]),
                                 overviews=o.get("overviews", True))
-        if not (outputs.geotiff or outputs.cog or outputs.mbtiles or outputs.dted_level is not None):
+        # Formats only apply to Kongsberg-ready packages; the other modes keep each file's own format.
+        if mode == "kongsberg" and not (outputs.geotiff or outputs.cog or outputs.mbtiles
+                                        or outputs.dted_level is not None):
             raise ValueError("Choose at least one output format")
         return bbox, layers, outputs
 
@@ -109,16 +135,17 @@ class JobManager:
     # -- run ---------------------------------------------------------------------------
     def submit(self, spec: dict) -> dict:
         bbox, layers, outputs = self.validate(spec)
+        mode = spec.get("mode") or "kongsberg"
         jid = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
         name = _safe(spec.get("name") or "area")
         j = {"id": jid, "name": name, "created": time.time(), "status": "queued", "message": "Queued",
-             "progress": 0.0, "spec": {**spec, "bbox": list(bbox.as_tuple())}, "layers": [], "log": [],
-             "package": None}
+             "progress": 0.0, "spec": {**spec, "bbox": list(bbox.as_tuple()), "mode": mode}, "layers": [],
+             "log": [], "package": None}
         with self.lock:
             self.jobs[jid] = j
             self.cancel[jid] = threading.Event()
         self._save(j)
-        self.pool.submit(self._run, jid, bbox, layers, outputs)
+        self.pool.submit(self._run, jid, bbox, layers, outputs, mode)
         return j
 
     def cancel_job(self, jid: str) -> None:
@@ -134,7 +161,8 @@ class JobManager:
         shutil.rmtree(self.s.jobs_dir / jid, ignore_errors=True)
         return True
 
-    def _run(self, jid: str, bbox: BBox, layers: list[dict], outputs: OutputOptions) -> None:
+    def _run(self, jid: str, bbox: BBox, layers: list[dict], outputs: OutputOptions,
+             mode: str = "kongsberg") -> None:
         j = self.jobs[jid]
         pkg = self.s.jobs_dir / jid / j["name"]
         pkg.mkdir(parents=True, exist_ok=True)
@@ -170,7 +198,7 @@ class JobManager:
                                      compression=layer.get("compression", "auto"))
                 folder = f"{i + 1:02d}_{_safe(src.id)}"
                 try:
-                    r = build_layer(src, bbox, lopts, outputs, pkg / folder, ctx, _safe(src.id))
+                    r = build_layer(src, bbox, lopts, outputs, pkg / folder, ctx, _safe(src.id), mode=mode)
                 except Cancelled:
                     raise
                 except Exception as e:
@@ -195,10 +223,17 @@ class JobManager:
         self._save(j)
 
     def _write_manifest(self, j: dict, pkg: Path, bbox: BBox) -> None:
+        mode = j.get("spec", {}).get("mode") or "kongsberg"
         manifest = {"name": j["name"], "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(j["created"])),
-                    "bbox_wsen": list(bbox.as_tuple()), "crs": "EPSG:4326 (WGS84 geographic)",
+                    "mode": mode, "mode_description": MODE_TEXT[mode][0],
+                    "bbox_wsen": list(bbox.as_tuple()),
+                    "crs": "EPSG:4326 (WGS84 geographic)" if mode == "kongsberg"
+                    else "each file keeps its own projection (see layers[].file_info)",
                     "generator": "MapForge", "layers": j["layers"]}
         (pkg / "manifest.json").write_text(json.dumps(manifest, indent=2))
+        if mode != "kongsberg":
+            self._write_unconverted_readme(j, pkg, bbox, mode)
+            return
         lines = [
             f"MapForge package: {j['name']}",
             f"Area (W,S,E,N): {', '.join(f'{v:.6f}' for v in bbox.as_tuple())}",
@@ -231,6 +266,36 @@ class JobManager:
             "Handling: observe the licence / distribution statement of every source above. Aeronautical",
             "charts are only current until their edition expires.",
         ]
+        (pkg / "README.txt").write_text("\n".join(lines) + "\n")
+
+    def _write_unconverted_readme(self, j: dict, pkg: Path, bbox: BBox, mode: str) -> None:
+        """README for 'clipped' / 'original' packages (called from _write_manifest)."""
+        title, body = MODE_TEXT[mode]
+        lines = [f"MapForge package: {j['name']}",
+                 f"Area (W,S,E,N): {', '.join(f'{v:.6f}' for v in bbox.as_tuple())}",
+                 "", f"Mode: {title}", *body, "", "Layers and files:"]
+        for x in j["layers"]:
+            if x["status"] != "ok":
+                lines.append(f"  (skipped) {x['name']}: {x.get('message', x['status'])}")
+                continue
+            lines += [f"  {x['folder']}/  {x['name']}  —  {x.get('summary', '')}",
+                      f"      licence: {x.get('license', '')}"]
+            for f in x.get("file_info", []):
+                bits = [f.get("format", "")]
+                if f.get("crs"):
+                    bits.append(f"projection {f['crs']}")
+                if f.get("width"):
+                    bits.append(f"{f['width']}x{f['height']} px, {f['bands']} band(s) {f['dtype']}"
+                                + (" (colour palette)" if f.get("palette") else ""))
+                bits.append(f"{f['size_mb']:g} MB")
+                lines.append(f"      {f['file']}: {'; '.join(b for b in bits if b)}")
+            extra = [n for n in x.get("files", []) if n not in {f["file"] for f in x.get("file_info", [])}]
+            if extra:
+                lines.append(f"      alongside: {', '.join(extra[:8])}{' …' if len(extra) > 8 else ''}"
+                             "  (world files / metadata that belong to the images above)")
+        lines += ["",
+                  "Handling: observe the licence / distribution statement of every source above. Aeronautical",
+                  "charts are only current until their edition expires."]
         (pkg / "README.txt").write_text("\n".join(lines) + "\n")
 
     def zip_path(self, jid: str) -> Path:
