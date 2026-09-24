@@ -14,7 +14,7 @@ from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import sources
+from . import delivery, sources
 from .jobs import JobManager
 from .settings import Settings, get_settings, set_settings
 from .sources.base import Auth, Context
@@ -129,12 +129,53 @@ def create_app(settings: Settings | None = None, allowed_hosts: set[str] | None 
         return {"ok": True}
 
     @app.get("/api/jobs/{jid}/download")
-    def download(jid: str):
+    def download(jid: str, layer: str | None = None):
         j = jobs.get(jid)
         if not j or j["status"] not in ("done", "partial"):
             raise HTTPException(404, "package not ready")
-        z = jobs.zip_path(jid)
+        try:
+            z = jobs.zip_path(jid, layer)
+        except delivery.DeliveryError as e:
+            raise HTTPException(404, str(e))
         return FileResponse(z, filename=z.name, media_type="application/zip")
+
+    # -- delivery: export to folder, split for media -----------------------------------------
+    def _deliver(fn, *args):
+        try:
+            return fn(jobs, *args)
+        except delivery.DeliveryConflict as e:
+            raise HTTPException(409, str(e))
+        except delivery.DeliveryError as e:
+            raise HTTPException(400, str(e))
+
+    @app.get("/api/export-roots")
+    def export_roots():
+        roots = [str(r) for r in delivery.export_roots(s)]
+        return {"roots": roots, "default": roots[0] if roots else None}
+
+    @app.post("/api/jobs/{jid}/export")
+    def export(jid: str, body: dict):
+        if not jobs.get(jid):
+            raise HTTPException(404, "unknown job")
+        return _deliver(delivery.start_export, jid, body.get("dest", ""), bool(body.get("overwrite")))
+
+    @app.post("/api/jobs/{jid}/split")
+    def split(jid: str, body: dict):
+        if not jobs.get(jid):
+            raise HTTPException(404, "unknown job")
+        return _deliver(delivery.start_split, jid, body.get("part_mb"))
+
+    @app.get("/api/jobs/{jid}/parts/{filename}")
+    def part(jid: str, filename: str):
+        if not jobs.get(jid) or not delivery.SAFE_FILE.fullmatch(filename):
+            raise HTTPException(404, "no such file")
+        folder = delivery.parts_dir(jobs, jid)
+        # Only serve names that are actually in the parts folder (no path is built from input).
+        names = {p.name: p for p in folder.iterdir() if p.is_file()} if folder.is_dir() else {}
+        if filename not in names:
+            raise HTTPException(404, "no such file")
+        media = "text/plain" if filename.endswith((".txt", "SUMS")) else "application/octet-stream"
+        return FileResponse(names[filename], filename=filename, media_type=media)
 
     # -- custom endpoints (NGA / PKI / commercial) -------------------------------------------
     @app.get("/api/endpoints")
