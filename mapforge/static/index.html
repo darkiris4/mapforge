@@ -18,69 +18,29 @@
     <button data-tab="endpoints">Endpoints / NGA</button>
     <button data-tab="library">Local library</button>
   </nav>
+  <div class="viewtoggle" role="group" aria-label="Build mode">
+    <button type="button" data-view="guided" aria-pressed="true" title="Step-by-step questions in plain language">Guided</button>
+    <button type="button" data-view="advanced" aria-pressed="false" title="All options on one page">Advanced</button>
+  </div>
 </header>
 
 <main>
   <!-- BUILD ------------------------------------------------------------------------------>
   <section id="tab-build" class="tab active">
-    <aside class="panel">
-      <div class="card">
-        <h3>1 · Area</h3>
-        <div class="row">
-          <button id="drawBtn" class="primary">▭ Draw box</button>
-          <button id="viewBtn">Use map view</button>
-        </div>
-        <div class="grid4">
-          <label>West<input id="bW" type="number" step="any"></label>
-          <label>South<input id="bS" type="number" step="any"></label>
-          <label>East<input id="bE" type="number" step="any"></label>
-          <label>North<input id="bN" type="number" step="any"></label>
-        </div>
-        <details>
-          <summary>Center + radius / paste coordinates</summary>
-          <div class="grid3">
-            <label>Lat<input id="cLat" type="number" step="any" placeholder="38.85"></label>
-            <label>Lon<input id="cLon" type="number" step="any" placeholder="-77.04"></label>
-            <label>Radius NM<input id="cRad" type="number" step="any" value="10"></label>
-          </div>
-          <button id="centerBtn">Set box from center</button>
-          <label>Paste “W,S,E,N”<input id="paste" placeholder="-77.15, 38.80, -76.95, 38.95"></label>
-        </details>
-        <div id="areaInfo" class="muted"></div>
-      </div>
-
-      <div class="card">
-        <h3>2 · Layers</h3>
-        <input id="srcFilter" placeholder="Filter sources…">
-        <div id="sources"></div>
-      </div>
-
-      <div class="card">
-        <h3>3 · Outputs</h3>
-        <div class="checks">
-          <label><input type="checkbox" id="oTif" checked> GeoTIFF (EPSG:4326, tiled + overviews)</label>
-          <label><input type="checkbox" id="oCog"> Cloud-Optimized GeoTIFF</label>
-          <label><input type="checkbox" id="oMbt"> MBTiles (web / mobile viewers)</label>
-          <label>DTED from elevation layers
-            <select id="oDted"><option value="">none</option><option value="0">Level 0 (30″)</option>
-              <option value="1" selected>Level 1 (3″ ≈ 90 m)</option><option value="2">Level 2 (1″ ≈ 30 m)</option></select>
-          </label>
-        </div>
-        <label>Package name<input id="jobName" placeholder="e.g. DCA_training_area"></label>
-        <div id="estimate" class="muted"></div>
-        <button id="buildBtn" class="primary big" disabled>Build package</button>
-      </div>
-    </aside>
+    <aside class="panel" id="panel" aria-live="polite"></aside>
     <div class="mapwrap">
       <div id="map"></div>
       <div class="maptools">
-        <select id="basemap">
-          <option value="osm">OpenStreetMap</option>
-          <option value="usgs">USGS imagery</option>
-          <option value="topo">USGS topo</option>
-          <option value="none">None (offline)</option>
+        <button type="button" id="mapClear" class="hidden danger" title="Remove the box (Delete key)">✕ Clear box</button>
+        <select id="basemap" aria-label="Background map">
+          <option value="osm">Street map</option>
+          <option value="usgs">Satellite (USGS)</option>
+          <option value="topo">Topographic (USGS)</option>
+          <option value="none">No background (grid)</option>
         </select>
       </div>
+      <div id="drawHint" class="drawhint hidden" role="status">Press and drag on the map to draw your area
+        <button type="button" class="x" aria-label="Stop drawing">Cancel (Esc)</button></div>
       <div id="legend" class="legend hidden" aria-label="Coverage legend"></div>
     </div>
   </section>
@@ -168,7 +128,13 @@
 </main>
 
 <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+<div id="glossPop" class="glosspop hidden" role="dialog" aria-label="Explanation"></div>
 <script src="vendor/leaflet/leaflet.js"></script>
+<script src="core.js"></script>
+<script src="map.js"></script>
+<script src="build.js"></script>
+<script src="jobs.js"></script>
+<script src="admin.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
