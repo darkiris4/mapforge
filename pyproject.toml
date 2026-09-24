@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "Self-hosted web tool to fetch, bound and convert aeronautical charts, imagery and elevation into map-engine-ready packages"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE", "mapforge/static/vendor/leaflet/LICENSE"]
 dependencies = [
   "rasterio>=1.4",
   "numpy>=1.26",

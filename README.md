@@ -199,3 +199,10 @@ packaging), `mapforge/app.py` (FastAPI) and `mapforge/static/` (UI).
 
 To add a provider, subclass `sources.base.Source` and return `Item`s (anything GDAL can open,
 plus a lon/lat footprint) from `items(bbox, res_m, ctx)`. The engine handles everything else.
+
+## License
+
+MapForge is released under the [MIT License](LICENSE). It bundles
+[Leaflet](https://leafletjs.com) 1.9.4 (BSD 2-Clause, see
+`mapforge/static/vendor/leaflet/LICENSE`). Data fetched by MapForge keeps its own licence
+and handling terms. Those are listed per source above and written into every package README.
