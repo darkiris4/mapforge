@@ -86,10 +86,14 @@ WantedBy=multi-user.target
 | Local library | Anything on disk: CADRG / CIB (`A.TOC`), ECRG (`TOC.xml`), DTED (`.dt0/.dt1/.dt2`), NITF, GeoTIFF, JPEG 2000 | This is where NGA products downloaded with your CAC go. See [docs/nga-and-pki.md](docs/nga-and-pki.md). |
 | Custom / controlled | XYZ, WMTS, WMS, ArcGIS ImageServer, ArcGIS tiled MapServer | Optional PKI client certificate, basic auth or header token. Presets exist for NGA GEGD WMTS/WMS. See [docs/nga-and-pki.md](docs/nga-and-pki.md). |
 
-When charts overlap, each output pixel comes from the chart it sits deepest inside, which keeps
-most chart collars and legends out of the mosaic. The FAA sheets carry no neatline data, so a
-thin sliver of collar can remain where two sheets meet at an unusually wide margin. Check seams
-before relying on a mosaic.
+**Chart collars.** FAA sheets carry no neatline data, so MapForge detects each chart's
+neatline from its pixels the first time the chart is used, and caches the result. Sectionals are
+clipped at the dark whole-minute parallel/meridian bordered by white paper. Other sheets (TACs,
+helicopter charts) get a pixel cut of white margins wherever that is unambiguous. Where charts
+still overlap, each pixel comes from the chart it sits deepest inside, measured from the clipped
+extent. Any side where detection is unsure is left unclipped rather than risk cutting real chart,
+so check the seams of unusual sheets (insets, IFR enroute panels) before relying on a mosaic.
+The `verify-map-output` project skill renders a contact sheet for exactly that.
 
 ---
 
