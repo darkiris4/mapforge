@@ -140,9 +140,75 @@ def check_dted(p: Path, rel: str) -> None:
                        f"{-ds.transform.e * 3600:.1f}\" voids={voids:.1f}% range={rng}")
 
 
+RASTER_EXT = {".tif", ".tiff", ".dt0", ".dt1", ".dt2", ".ntf", ".nitf", ".jp2", ".img"}
+
+
+def check_native(p: Path, rel: str, bbox, mode: str) -> None:
+    """clipped / original packages: files keep their own projection and format."""
+    from rasterio.warp import transform_bounds
+
+    with rasterio.open(p) as ds:
+        if ds.crs is None:
+            rec("FAIL", rel, "no projection / georeferencing")
+            return
+        b = transform_bounds(ds.crs, "EPSG:4326", *ds.bounds, densify_pts=21)
+        comp = (ds.compression.value if ds.compression else "none").lower()
+        desc = (f"{ds.width}x{ds.height} {ds.count}b {ds.dtypes[0]} {comp} {ds.crs.to_string()[:40]}"
+                + (" palette" if ds.count == 1 and ds.colorinterp[0].name == "palette" else ""))
+    if bbox:
+        overlaps = not (b[2] <= bbox[0] or b[0] >= bbox[2] or b[3] <= bbox[1] or b[1] >= bbox[3])
+        if not overlaps:
+            rec("FAIL", rel, "does not overlap the package area")
+            return
+        if mode == "clipped":
+            # Cut in its own projection, so its lon/lat footprint may bulge a little past the box.
+            pad_x, pad_y = (bbox[2] - bbox[0]) * 0.25, (bbox[3] - bbox[1]) * 0.25
+            if b[0] < bbox[0] - pad_x or b[2] > bbox[2] + pad_x or b[1] < bbox[1] - pad_y or b[3] > bbox[3] + pad_y:
+                rec("FAIL", rel, f"clipped file reaches far outside the area: {tuple(round(v, 4) for v in b)}")
+                return
+    rec("OK", rel, desc)
+
+
+def check_checksums(pkg: Path) -> None:
+    import hashlib
+
+    sums = pkg / "SHA256SUMS"
+    if not sums.exists():
+        rec("WARN", "SHA256SUMS", "missing (packages from before checksums were added)")
+        return
+    bad, n = [], 0
+    for line in sums.read_text().splitlines():
+        if not line.strip():
+            continue
+        digest, name = line.split(None, 1)
+        name = name.lstrip("*")
+        f = pkg / name
+        n += 1
+        if not f.exists():
+            bad.append(f"{name} missing")
+            continue
+        h = hashlib.sha256()
+        with open(f, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        if h.hexdigest() != digest:
+            bad.append(f"{name} mismatch")
+    if bad:
+        rec("FAIL", "SHA256SUMS", "; ".join(bad[:5]) + (" …" if len(bad) > 5 else ""))
+    else:
+        rec("OK", "SHA256SUMS", f"all {n} file(s) verified")
+
+
 def thumbnail(p: Path, kind: str, h: int = 360) -> np.ndarray:
     with rasterio.open(p) as ds:
         w = max(1, round(ds.width * h / ds.height))
+        if ds.count == 1 and ds.colorinterp[0].name == "palette":
+            idx = ds.read(1, out_shape=(h, w), resampling=Resampling.nearest)
+            lut = np.zeros((256, 3), np.uint8)
+            for k, v in ds.colormap(1).items():
+                if 0 <= k < 256:
+                    lut[k] = v[:3]
+            return np.moveaxis(lut[idx], -1, 0)
         if kind == "elevation" or ds.count == 1:
             z = ds.read(1, out_shape=(h, w), resampling=Resampling.average).astype(np.float64)
             if ds.nodata is not None:
@@ -172,6 +238,9 @@ def main() -> int:
         print(f"FAIL {pkg}: no manifest.json or layer.json — pass a package or layer folder")
         return 1
     bbox = manifest.get("bbox_wsen")
+    mode = manifest.get("mode", "kongsberg")
+    if mode != "kongsberg":
+        rec("OK", "manifest.json", f"mode: {manifest.get('mode_description', mode)}")
     thumbs = []
     for layer in manifest.get("layers", []):
         if layer.get("status") != "ok":
@@ -185,7 +254,14 @@ def main() -> int:
                 rec("FAIL", rel, "listed in manifest but missing")
                 continue
             try:
-                if p.suffix.lower() == ".tif":
+                if mode != "kongsberg":
+                    if p.suffix.lower() in RASTER_EXT:
+                        check_native(p, rel, bbox, mode)
+                        if p.suffix.lower() in (".tif", ".tiff"):
+                            thumbs.append((p, layer.get("kind", "rgb")))
+                    else:
+                        rec("OK", rel, "present (sidecar / metadata)")
+                elif p.suffix.lower() == ".tif":
                     check_tif(p, rel, layer, bbox)
                     if not f.endswith("_cog.tif"):
                         thumbs.append((p, layer.get("kind", "rgb")))
@@ -197,6 +273,8 @@ def main() -> int:
                     rec("OK", rel, "present")
             except Exception as e:  # noqa: BLE001 — report, keep checking the rest
                 rec("FAIL", rel, f"could not open: {e}")
+    if man.exists():
+        check_checksums(pkg)
     if a.sheet and thumbs:
         tiles = [thumbnail(p, k) for p, k in thumbs]
         gap = np.full((3, tiles[0].shape[1], 8), 255, np.uint8)

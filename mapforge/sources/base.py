@@ -6,6 +6,7 @@ a new data provider only needs to know how to find/fetch rasters, never how to m
 """
 from __future__ import annotations
 
+import math
 import threading
 import time
 from dataclasses import asdict, dataclass, field
@@ -14,6 +15,7 @@ from typing import Callable
 
 import httpx
 
+from .. import speeds
 from ..geo import BBox
 from ..settings import Settings
 
@@ -120,6 +122,8 @@ class Item:
     # Optional lon/lat polygons ([(lon, lat), ...]); only pixels inside all of them are used.
     # Charts use this to drop collars/legends outside the neatline.
     clip: list[list[tuple[float, float]]] | None = None
+    # True for rasters built from a map service (tiles/WMS), which publishes no files to copy.
+    service: bool = False
 
 
 @dataclass
@@ -151,6 +155,7 @@ class Context:
             tmp = dest.with_name(dest.name + ".part")
             name = label or dest.name
             timeout = httpx.Timeout(30.0, read=60.0)
+            t_start, fetched = time.monotonic(), 0  # for the learned-speed sample
             for attempt in range(attempts):
                 self.check()
                 have = tmp.stat().st_size if tmp.exists() else 0
@@ -169,6 +174,7 @@ class Context:
                                 self.check()
                                 f.write(chunk)
                                 done += len(chunk)
+                                fetched += len(chunk)
                                 now = time.monotonic()
                                 if now - last > 1:
                                     last = now
@@ -183,6 +189,8 @@ class Context:
                     self.progress(f"Downloading {name}: connection problem ({type(e).__name__}), resuming…", None)
                     time.sleep(min(30, 2 * 2**attempt))
             tmp.replace(dest)
+            if fetched >= 1 << 20:  # ignore tiny files: latency dominates
+                speeds.record(self.settings, speeds.host_key("bytes", url), fetched, time.monotonic() - t_start)
             return dest
 
 
@@ -198,6 +206,10 @@ class Source:
     min_res_m: float = 0.1  # finest resolution worth requesting
     # "nearest" keeps chart linework crisp; imagery/elevation look better bilinear.
     resampling: str = "bilinear"
+    # Plain-language metadata for people who are not GIS specialists (guided mode).
+    category: str = "custom"  # vfr | ifr | imagery | elevation | local | custom
+    plain_name: str = ""
+    explain: str = ""
 
     def info(self) -> dict:
         return {
@@ -211,7 +223,26 @@ class Source:
             "default_res_m": self.default_res_m,
             "min_res_m": self.min_res_m,
             "coverage": self.has_coverage(),
+            "category": self.category,
+            "plain_name": self.plain_name or self.name,
+            "explain": self.explain or self.description,
+            "detail_levels": self.detail_levels(),
         }
+
+    def detail_levels(self) -> list[dict]:
+        """Resolution choices in plain words, ordered coarse -> fine."""
+        return generic_detail_levels(self.kind, self.default_res_m, self.min_res_m)
+
+    def estimate(self, bbox: BBox, res_m: float, settings: Settings) -> dict:
+        """What fetching this layer will cost, before anything is downloaded.
+
+        Returns download_mb (still to fetch; cache excluded), cached_pct, requests,
+        download_seconds, notes (plain sentences), speed_basis ("measured"|"default"),
+        and optionally source_mb (full source files, for "original" packages) and
+        clipped_mb (source cut to the box, for "clipped" packages).
+        Sources that cannot say anything useful return an unknown-cost estimate.
+        """
+        return estimate_result(notes=["Download size can't be predicted for this source."])
 
     def has_coverage(self) -> bool:
         return False
@@ -222,3 +253,58 @@ class Source:
 
     def items(self, bbox: BBox, res_m: float, ctx: Context) -> list[Item]:
         raise NotImplementedError
+
+
+# --------------------------------------------------------------------------------------
+# Estimate helpers shared by the sources
+# --------------------------------------------------------------------------------------
+def estimate_result(download_bytes: float = 0.0, cached_pct: float = 0.0, requests: int | None = None,
+                    seconds: float = 0.0, notes: list[str] | None = None, basis: str = "default",
+                    source_bytes: float | None = None, clipped_bytes: float | None = None) -> dict:
+    out = {"download_mb": round(download_bytes / 1e6, 1), "cached_pct": round(max(0.0, min(100.0, cached_pct))),
+           "requests": requests, "download_seconds": int(math.ceil(seconds)), "notes": notes or [],
+           "speed_basis": basis}
+    if source_bytes is not None:
+        out["source_mb"] = round(source_bytes / 1e6, 1)
+    if clipped_bytes is not None:
+        out["clipped_mb"] = round(clipped_bytes / 1e6, 1)
+    return out
+
+
+def plain_duration(seconds: float) -> str:
+    s = max(0, int(round(seconds)))
+    if s < 60:
+        return "under a minute"
+    if s < 3600:
+        return f"about {max(1, round(s / 60))} min"
+    return f"about {s / 3600:.1f} h"
+
+
+def speed_note(basis: str) -> list[str]:
+    return [] if basis == "measured" else [
+        "Time is a rough guess until MapForge has measured this server's speed on your network."]
+
+
+def cached_note(cached_pct: float, download_bytes: float) -> list[str]:
+    if download_bytes <= 0 and cached_pct >= 99.5:
+        return ["Already downloaded earlier — no wait."]
+    if cached_pct >= 1:
+        return [f"About {round(cached_pct)}% is already downloaded; only the rest is fetched."]
+    return []
+
+
+def _level(id_: str, label: str, res_m: float, hint: str) -> dict:
+    return {"id": id_, "label": label, "res_m": round(float(res_m), 3), "hint": hint}
+
+
+def generic_detail_levels(kind: str, default_res_m: float, min_res_m: float = 0.1) -> list[dict]:
+    """Sensible coarse->fine choices around a source's normal resolution."""
+    d = float(default_res_m or 10.0)
+    if kind == "elevation":
+        levels = [_level("overview", "Coarse terrain", d * 4, "Broad hills and valleys; small download"),
+                  _level("native", "Full detail", d, "The source's own spacing")]
+    else:
+        levels = [_level("overview", "Wide-area overview", d * 8, "Coastlines, cities and major roads"),
+                  _level("area", "Area detail", d * 3, "Streets and large buildings"),
+                  _level("native", "Full detail", d, "The source's own resolution")]
+    return [lv for lv in levels if lv["res_m"] >= (min_res_m or 0) * 0.999]

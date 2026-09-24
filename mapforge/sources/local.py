@@ -17,7 +17,7 @@ import rasterio
 from rasterio.warp import transform_bounds
 
 from ..geo import BBox
-from .base import Context, Item, Source
+from .base import Context, Item, Source, _level, estimate_result
 
 RASTER_EXT = {".tif", ".tiff", ".ntf", ".nitf", ".nsf", ".jp2", ".img", ".vrt", ".sid", ".ecw"}
 DTED_RE = re.compile(r"\.dt([012])$", re.I)
@@ -141,6 +141,14 @@ class LocalProduct(Source):
         name = self.name.upper()
         if "CADRG" in name or "ECRG" in name or "CIB" in name:
             self.resampling = "nearest" if "CIB" not in name else "bilinear"
+        self.category = "local"
+        self.plain_name = self.name
+        self.explain = _explain(name, self.kind, n, product["root"])
+
+    def detail_levels(self) -> list[dict]:
+        d = self.default_res_m
+        return [_level("overview", "Lighter download", d * 4, "A quarter of the detail in each direction"),
+                _level("native", "Full detail", d, "The files' own resolution")]
 
     def has_coverage(self) -> bool:
         return True
@@ -151,6 +159,46 @@ class LocalProduct(Source):
     def items(self, bbox: BBox, res_m: float, ctx: Context) -> list[Item]:
         return [Item(path=i["path"], footprint=BBox(*i["bbox"]), label=Path(i["path"]).name, native_res_m=i["res_m"])
                 for i in self.p["items"] if bbox.intersects(BBox(*i["bbox"]))]
+
+    def estimate(self, bbox: BBox, res_m: float, settings) -> dict:
+        hits = [i for i in self.p["items"] if bbox.intersects(BBox(*i["bbox"]))]
+        if not hits:
+            return estimate_result(cached_pct=100, notes=["None of these files cover this area."],
+                                   source_bytes=0, clipped_bytes=0)
+        source = clipped = 0.0
+        known = True
+        for i in hits:
+            size = _file_size(i["path"])
+            if size is None:
+                known = False
+                continue
+            fp = BBox(*i["bbox"])
+            inter = bbox.intersection(fp)
+            frac = ((inter.east - inter.west) * (inter.north - inter.south)
+                    / max((fp.east - fp.west) * (fp.north - fp.south), 1e-12)) if inter else 0.0
+            source += size
+            clipped += size * frac
+        n = len(hits)
+        notes = [f"Already on this server ({n} file{'s' if n != 1 else ''} cover this area) — no download."]
+        return estimate_result(0, 100, 0, 0, notes, "measured",
+                               source_bytes=source if known else None, clipped_bytes=clipped if known else None)
+
+
+def _explain(upper_name: str, kind: str, n: int, root: str) -> str:
+    what = ("NGA scanned aeronautical charts (CADRG)" if "CADRG" in upper_name
+            else "NGA enhanced scanned charts (ECRG)" if "ECRG" in upper_name
+            else "NGA controlled image base — grey-scale satellite imagery (CIB)" if "CIB" in upper_name
+            else "Elevation cells in the standard military DTED format" if "DTED" in upper_name
+            else "Elevation files" if kind == "elevation" else "Map or imagery files")
+    return f"{what}: {n} file(s) already on this server under {root}."
+
+
+def _file_size(path: str) -> int | None:
+    """Size of a library item on disk (None for subdatasets we can't size cheaply, e.g. RPF TOC entries)."""
+    p = Path(path)
+    if p.is_file():
+        return p.stat().st_size
+    return None
 
 
 def local_sources(settings) -> list[Source]:

@@ -31,6 +31,16 @@ To produce a package to verify, either submit a job through the API (see `run-ma
 dict until its status leaves `queued`/`running`. Keep test areas small (≈0.1–0.2°) so jobs finish
 in a minute or two; reuse a data dir with a warm cache to avoid re-downloading charts.
 
+The checker reads the package's `mode` from `manifest.json`:
+- **kongsberg** packages get the strict checks below.
+- **clipped** and **original** packages get native checks:
+  - every raster opens and has a projection
+  - clipped files stay near the area
+  - original files overlap it
+  - sidecars are present
+
+All modes verify `SHA256SUMS`. Packages built before checksums existed only get a WARN.
+
 ## What the checks mean
 
 | Check | Why it matters |

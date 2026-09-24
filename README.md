@@ -23,16 +23,28 @@ scripts/install.sh          # creates ./.venv and installs MapForge
 scripts/run.sh              # http://127.0.0.1:8765
 ```
 
-Open `http://127.0.0.1:8765` and follow the three steps on the Build tab:
+Open `http://127.0.0.1:8765`. The Build tab has two views; switch with the toggle top-right
+(your choice is remembered):
 
-1. **Area**: draw a box, type W/S/E/N, paste `W,S,E,N`, or give a center plus a radius in NM.
-2. **Layers**: tick sources. Leave resolution empty for native, or set metres/pixel. The ◎
-   button shows each source's coverage footprints on the map.
-3. **Outputs**: GeoTIFF (default), COG, MBTiles, and DTED level 0/1/2 for elevation layers.
-   The estimate shows the pixel size and approximate MB of each layer before you build.
+- **Guided** (default on first visit) walks through six plain-language steps:
+  1. **Where**: draw a box, give a centre + radius in NM, type or paste W,S,E,N. *Clear box*
+     (or Delete/Esc) removes it.
+  2. **What**: pick by need (VFR charts, IFR charts, satellite/aerial imagery, terrain
+     elevation, your own/NGA files, custom services), not by provider.
+  3. **How detailed**: named levels such as *Regional overview*, *Area detail* or *Street-level*,
+     each with a one-line hint of what you'll be able to see. The metres/pixel value is shown
+     in small print for those who want it.
+  4. **What to produce**: one of three output modes (below). File formats appear only where
+     they apply.
+  5. **How to deliver**: browser download, per-layer download, save to a server folder or
+     share, and/or split for removable media.
+  6. **Review**: everything on one page with *Change* links, then **Build package**.
+- **Advanced** shows every option on one screen for people who know what they want.
 
-Jobs run in the background. The **Jobs** tab shows progress, each layer's result, the package
-path on the server, and a **Download .zip** button.
+Every selected layer shows its **download size, time to download and package size** before
+you commit ("Already downloaded — no wait", "Download 180 MB, about 2 min, 20% already here").
+Estimates learn your real download speeds as you use MapForge. Slow requests, such as a 3-hour
+NAIP export, are flagged in plain words with a cheaper alternative.
 
 To serve other machines on your LAN, set a token:
 
@@ -99,10 +111,24 @@ The `verify-map-output` project skill renders a contact sheet for exactly that.
 
 ## Output package
 
+### Output modes
+
+| Mode | What you get | Use it for |
+|---|---|---|
+| **Ready for Kongsberg** (default) | Each source merged into one seamless raster, reprojected to WGS84 lat/lon (EPSG:4326), with overviews. Chart collars removed. Optional COG, MBTiles, DTED 0/1/2. | Loading straight into TerraLens |
+| **Clipped, not converted** | Each source file cut to your area and otherwise unchanged: its own projection, colour palette and data type. Nothing merged, collars kept. Tile services are cut in their own projection. | GIS tools that handle projections themselves; faithful small extracts |
+| **Original files** | The source files exactly as published, whole and not cut, with their sidecars (e.g. `.tfw`, `.htm`). Tile services, which publish no files, are cut to the area in their own projection. | Archiving; handing data to other software unchanged |
+
+Each package's `README.txt` says which mode it was built with and, for the unconverted modes,
+lists every file's projection, size and format.
+
+### Layout (Kongsberg mode)
+
 ```
 <name>/
 ├── README.txt            layer list (coarsest first), native display scale + suggested scale range, licences
-├── manifest.json         machine-readable: bbox, CRS, per-layer resolution, size, inputs (chart editions), files
+├── manifest.json         machine-readable: mode, bbox, CRS, per-layer resolution, size, inputs (chart editions), files
+├── SHA256SUMS            checksums of every file (`sha256sum -c SHA256SUMS`)
 ├── 01_faa-sectional/
 │   ├── faa-sectional.tif          GeoTIFF, EPSG:4326, 512×512 tiles, internal overviews + mask
 │   ├── faa-sectional_cog.tif      (optional) Cloud-Optimized GeoTIFF
@@ -116,6 +142,36 @@ The `verify-map-output` project skill renders a contact sheet for exactly that.
 
 Compression is lossless (deflate) for charts and elevation and JPEG q90 for imagery. You can
 override this per layer through the API (`compression`: `jpeg|deflate|lzw|none`).
+
+## Delivering packages
+
+Every finished package has a `SHA256SUMS` file covering all its files. After moving a package,
+prove it arrived intact with `sha256sum -c SHA256SUMS` in the package folder (Windows:
+`certutil -hashfile <file> SHA256` and compare).
+
+From the Jobs page you can:
+
+| Option | What you get |
+|---|---|
+| **Download zip** | The whole package as one zip. |
+| **Download one layer** | A zip of a single layer folder plus the package README, manifest and `SHA256SUMS`. |
+| **Save to folder** | A copy of the package folder written into a folder on the MapForge server, for example a mounted network share. The copy is checksum-verified after writing. Only folders under `MAPFORGE_EXPORT_DIRS` are allowed (default `data/exports`). An existing non-empty package folder is only replaced if you tick *overwrite*. |
+| **Split for removable media** | The package zip cut into fixed-size parts (`name.zip.001`, `.002`, …): CD 700 MB, DVD 4.7 GB, FAT32 USB 4 GB, BD-R 25 GB or a custom size. Each split comes with a `SHA256SUMS` for the parts and the joined zip, plus `JOIN-README.txt`. |
+
+Joining split parts on the target machine (also in `JOIN-README.txt`):
+
+```bash
+cat name.zip.* > name.zip && sha256sum -c SHA256SUMS && unzip name.zip       # Linux / macOS
+```
+```bat
+copy /b name.zip.001+name.zip.002 name.zip                                     :: Windows
+```
+Or open `name.zip.001` in 7-Zip, which reads the other parts automatically.
+
+API: `GET /api/jobs/{id}/download[?layer=<folder>]`, `GET /api/export-roots`,
+`POST /api/jobs/{id}/export {"dest": "/abs/path", "overwrite": false}`,
+`POST /api/jobs/{id}/split {"part_mb": 4095}`, `GET /api/jobs/{id}/parts/{file}`. Exports and splits
+run in the background; their state is in the job's `deliveries` list.
 
 ## Loading into Kongsberg TerraLens
 
@@ -142,6 +198,7 @@ elevation data sources. In short:
 | `MAPFORGE_TOKEN` | – | unset | When set, every `/api` call needs the header `X-MapForge-Token` (the UI prompts for it once). |
 | `MAPFORGE_MAX_PIXELS` | – | `2000000000` | Per-layer pixel limit. Larger requests are refused with a hint. |
 | `MAPFORGE_WORKERS` | – | `2` | Jobs processed concurrently. |
+| `MAPFORGE_EXPORT_DIRS` | – | `$MAPFORGE_DATA/exports` | Folders a finished package may be copied into ("Save to folder"), `:`-separated, e.g. mounted shares. Nothing outside them can be written. |
 | `MAPFORGE_USER_AGENT` | – | `MapForge/0.1 …` | User-Agent sent to data providers. |
 
 MapForge has no user accounts. Treat it as a single-team tool: keep it on a trusted network,
