@@ -23,16 +23,28 @@ scripts/install.sh          # creates ./.venv and installs MapForge
 scripts/run.sh              # http://127.0.0.1:8765
 ```
 
-Open `http://127.0.0.1:8765` and follow the three steps on the Build tab:
+Open `http://127.0.0.1:8765`. The Build tab has two views; switch with the toggle top-right
+(your choice is remembered):
 
-1. **Area**: draw a box, type W/S/E/N, paste `W,S,E,N`, or give a center plus a radius in NM.
-2. **Layers**: tick sources. Leave resolution empty for native, or set metres/pixel. The ◎
-   button shows each source's coverage footprints on the map.
-3. **Outputs**: GeoTIFF (default), COG, MBTiles, and DTED level 0/1/2 for elevation layers.
-   The estimate shows the pixel size and approximate MB of each layer before you build.
+- **Guided** (default on first visit) walks through six plain-language steps:
+  1. **Where**: draw a box, give a centre + radius in NM, type or paste W,S,E,N. *Clear box*
+     (or Delete/Esc) removes it.
+  2. **What**: pick by need (VFR charts, IFR charts, satellite/aerial imagery, terrain
+     elevation, your own/NGA files, custom services), not by provider.
+  3. **How detailed**: named levels such as *Regional overview*, *Area detail* or *Street-level*,
+     each with a one-line hint of what you'll be able to see. The metres/pixel value is shown
+     in small print for those who want it.
+  4. **What to produce**: one of three output modes (below). File formats appear only where
+     they apply.
+  5. **How to deliver**: browser download, per-layer download, save to a server folder or
+     share, and/or split for removable media.
+  6. **Review**: everything on one page with *Change* links, then **Build package**.
+- **Advanced** shows every option on one screen for people who know what they want.
 
-Jobs run in the background. The **Jobs** tab shows progress, each layer's result, the package
-path on the server, and a **Download .zip** button.
+Every selected layer shows its **download size, time to download and package size** before
+you commit ("Already downloaded — no wait", "Download 180 MB, about 2 min, 20% already here").
+Estimates learn your real download speeds as you use MapForge. Slow requests, such as a 3-hour
+NAIP export, are flagged in plain words with a cheaper alternative.
 
 To serve other machines on your LAN, set a token:
 
@@ -99,10 +111,24 @@ The `verify-map-output` project skill renders a contact sheet for exactly that.
 
 ## Output package
 
+### Output modes
+
+| Mode | What you get | Use it for |
+|---|---|---|
+| **Ready for Kongsberg** (default) | Each source merged into one seamless raster, reprojected to WGS84 lat/lon (EPSG:4326), with overviews. Chart collars removed. Optional COG, MBTiles, DTED 0/1/2. | Loading straight into TerraLens |
+| **Clipped, not converted** | Each source file cut to your area and otherwise unchanged: its own projection, colour palette and data type. Nothing merged, collars kept. Tile services are cut in their own projection. | GIS tools that handle projections themselves; faithful small extracts |
+| **Original files** | The source files exactly as published, whole and not cut, with their sidecars (e.g. `.tfw`, `.htm`). Tile services, which publish no files, are cut to the area in their own projection. | Archiving; handing data to other software unchanged |
+
+Each package's `README.txt` says which mode it was built with and, for the unconverted modes,
+lists every file's projection, size and format.
+
+### Layout (Kongsberg mode)
+
 ```
 <name>/
 ├── README.txt            layer list (coarsest first), native display scale + suggested scale range, licences
-├── manifest.json         machine-readable: bbox, CRS, per-layer resolution, size, inputs (chart editions), files
+├── manifest.json         machine-readable: mode, bbox, CRS, per-layer resolution, size, inputs (chart editions), files
+├── SHA256SUMS            checksums of every file (`sha256sum -c SHA256SUMS`)
 ├── 01_faa-sectional/
 │   ├── faa-sectional.tif          GeoTIFF, EPSG:4326, 512×512 tiles, internal overviews + mask
 │   ├── faa-sectional_cog.tif      (optional) Cloud-Optimized GeoTIFF
