@@ -200,11 +200,11 @@ class FaaSource(Source):
 
     def items(self, bbox: BBox, res_m: float, ctx: Context) -> list[Item]:
         out = []
-        for e in self._index(ctx):
+        wanted = [e for e in self._index(ctx) if bbox.intersects(BBox(*e["bbox"]))]
+        for n, e in enumerate(wanted):
             fp = BBox(*e["bbox"])
-            if not bbox.intersects(fp):
-                continue
             ctx.check()
+            ctx.progress(f"{self.name}: chart {n + 1}/{len(wanted)} ({e['label']})", n / len(wanted))
             zip_name = e["url"].rsplit("/", 1)[1]
             folder = ctx.settings.cache_dir / "faa" / e["edition"]
             tif = folder / Path(e["member"]).name

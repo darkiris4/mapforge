@@ -8,7 +8,7 @@ from __future__ import annotations
 import hashlib
 import math
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -68,9 +68,9 @@ class CopernicusDEM(Source):
             local = cache / url.rsplit("/", 1)[1]
             touched = bbox.intersection(fp)
             frac = ((touched.east - touched.west) * (touched.north - touched.south)) if touched else 0.0
+            ctx.progress(f"{self.name}: tile {i}/{len(present)}", (i - 1) / max(len(present), 1))
             if local.exists() or frac >= self.DOWNLOAD_FRACTION:
                 # Mostly-covered tiles are fetched once and cached for later jobs.
-                ctx.progress(f"{self.name}: tile {i}/{len(present)}", None)
                 path = str(ctx.download(url, local, label=f"DEM tile {i}/{len(present)}"))
             else:
                 # Small overlap: read just the needed window of the COG over HTTP.
@@ -85,6 +85,7 @@ class CopernicusDEM(Source):
 # --------------------------------------------------------------------------------------
 class ArcGISImageServer(Source):
     access = "public"
+    WORKERS = 4
     CHUNK = 2000  # px per request edge; servers cap at ~4000 and time out on big exports
 
     def __init__(self, id, name, url, group, kind="rgb", band_ids="0,1,2", extent=None, description="",
@@ -147,12 +148,25 @@ class ArcGISImageServer(Source):
             return Item(path=str(dest), footprint=cb, native_res_m=res_m, gdal_env=self.auth.gdal_env(),
                         label=f"{self.id} export {cb.west:.4f},{cb.south:.4f}")
 
-        out: list[Item] = []
-        with ThreadPoolExecutor(4) as pool:
-            for i, item in enumerate(pool.map(fetch, jobs), 1):
-                ctx.progress(f"{self.name}: fetched {i}/{len(jobs)} chunks", None)
-                out.append(item)
-        return out
+        # Report in completion order: pool.map would stall the count behind one slow chunk.
+        out: list[Item | None] = [None] * len(jobs)
+        ctx.progress(f"{self.name}: requesting {len(jobs)} export chunk(s) from the server", 0.0)
+        with ThreadPoolExecutor(self.WORKERS) as pool:
+            futures = {pool.submit(fetch, job): n for n, job in enumerate(jobs)}
+            for done, fut in enumerate(as_completed(futures), 1):
+                out[futures[fut]] = fut.result()
+                ctx.progress(f"{self.name}: fetched {done}/{len(jobs)} chunks", done / len(jobs))
+        return [i for i in out if i is not None]
+
+    def chunk_count(self, bbox: BBox, res_m: float) -> int:
+        """Number of exportImage requests items() will make (for the size estimate)."""
+        if self.extent:
+            bbox = bbox.intersection(BBox(*self.extent))
+            if not bbox:
+                return 0
+        xd, yd = meters_to_deg(res_m, bbox.center_lat)
+        return (math.ceil((bbox.east - bbox.west) / (self.CHUNK * xd) - 1e-9)
+                * math.ceil((bbox.north - bbox.south) / (self.CHUNK * yd) - 1e-9))
 
 
 # --------------------------------------------------------------------------------------

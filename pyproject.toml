@@ -30,3 +30,8 @@ include = ["mapforge*"]
 
 [tool.setuptools.package-data]
 mapforge = ["static/**/*"]
+
+[tool.pytest.ini_options]
+# Import the checkout under test, not whatever copy the venv has installed (editable installs
+# point at one checkout; worktrees and CI would otherwise silently test that one).
+pythonpath = ["."]
