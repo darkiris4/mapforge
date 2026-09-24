@@ -119,3 +119,29 @@ def test_non_network_read_errors_are_not_retried():
     with pytest.raises(rasterio.errors.RasterioIOError):
         process.read_with_retry(boom, delays=(0, 0))
     assert calls == [1]
+
+
+def test_bar_keeps_moving_during_a_slow_tile_download(settings, tmp_path, flaky, monkeypatch):
+    """The user saw the bar sit at 48% with a frozen ETA while one big read downloaded tiles.
+    Services are now read in small blocks, with a progress update after each."""
+    import time as _time
+
+    slow = FlakyTiles.do_GET
+
+    def slow_get(self):
+        _time.sleep(0.03)  # a slow map server
+        slow(self)
+
+    monkeypatch.setattr(FlakyTiles, "do_GET", slow_get)
+    FlakyTiles.policy = staticmethod(lambda path, n, total: False)
+    events = []
+    ctx = Context(settings, progress=lambda m, f=None: events.append((_time.monotonic(), m, f)))
+    res = build_layer(tile_source(flaky), BBox(-77.10, 38.84, -76.95, 38.96), LayerOptions(res_m=5),
+                      OutputOptions(overviews=False), tmp_path / "out", ctx, "slow", mode="clipped")
+    assert res["status"] == "ok"
+    parts = [m for _, m, _ in events if "part " in m]
+    assert len(parts) >= 4 and parts[-1].endswith(f"part {len(parts)} of {len(parts)}"), parts
+    fracs = [f for _, _, f in events if f is not None]
+    assert all(b >= a - 1e-9 for a, b in zip(fracs, fracs[1:])), "bar went backwards"
+    times = [t for t, _, _ in events]
+    assert max(b - a for a, b in zip(times, times[1:])) < 2.0  # no long silences

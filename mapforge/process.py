@@ -191,6 +191,7 @@ def _clip_bbox(polys, fp: BBox) -> BBox:
 # connection (verified in tests/test_resilience.py), and it keeps every tile it already fetched in
 # its on-disk cache, so retrying the read re-downloads only what is missing.
 NET_RETRY_DELAYS_S = (2, 5, 15, 30)
+SERVICE_BLOCK = 1024  # px: 4x4 tiles per read, so progress updates every few seconds
 _NET_ERR = re.compile(r"Unable to download block|Recv failure|Connection reset|Connection refused|"
                       r"timed out|Timeout was reached|Couldn't connect|Empty reply|SSL|"
                       r"HTTP status code: 5\d\d|Operation too slow", re.I)
@@ -673,6 +674,8 @@ def _source_window(ds, bbox: BBox) -> Window | None:
     return win if win.width >= 1 and win.height >= 1 else None
 
 
+
+
 def write_clip(ds, bbox: BBox, dst_path: Path, ctx: Context, is_service: bool = False) -> bool:
     """Cut ds to bbox without reprojecting: same CRS, dtype, bands, palette and nodata.
 
@@ -708,7 +711,14 @@ def write_clip(ds, bbox: BBox, dst_path: Path, ctx: Context, is_service: bool = 
             mask_from = "alpha"
         elif alpha is None and any(MaskFlags.per_dataset in f for f in ds.mask_flag_enums):
             mask_from = "mask"
+    # Map services fetch tiles during each read, so read them in small blocks (4x4 tiles) and
+    # report after each one: the bar moves every few seconds. Files are read in big strips.
     rows = max(1, min(height, (64 << 20) // max(1, width * len(bands) * np.dtype(dtype).itemsize)))
+    cols = width
+    if is_service:
+        rows = cols = SERVICE_BLOCK
+    blocks = [(r, c) for r in range(0, height, rows) for c in range(0, width, cols)]
+    what = "map server" if is_service else "source file"
     with rasterio.Env(GDAL_TIFF_INTERNAL_MASK=True), rasterio.open(dst_path, "w", **prof) as dst:
         if palette:
             dst.write_colormap(1, ds.colormap(1))
@@ -717,19 +727,18 @@ def write_clip(ds, bbox: BBox, dst_path: Path, ctx: Context, is_service: bool = 
         for i, b in enumerate(bands, 1):
             if ds.descriptions[b - 1]:
                 dst.set_band_description(i, ds.descriptions[b - 1])
-        for r in range(0, height, rows):
+        for n, (r, c) in enumerate(blocks, 1):
             ctx.check()
-            h = min(rows, height - r)
-            src_win = Window(win.col_off, win.row_off + r, width, h)
-            dst_win = Window(0, r, width, h)
-            what = "map server" if is_service else "source file"
+            h, w = min(rows, height - r), min(cols, width - c)
+            src_win = Window(win.col_off + c, win.row_off + r, w, h)
+            dst_win = Window(c, r, w, h)
             dst.write(read_with_retry(lambda: ds.read(bands, window=src_win), ctx.check, what,
                                       lambda m: ctx.progress(m, None)), window=dst_win)
             if mask_from:
                 m = read_with_retry(lambda: ds.read(alpha, window=src_win) if mask_from == "alpha"
                                     else ds.read_masks(1, window=src_win), ctx.check, what)
                 dst.write_mask(np.where(m > 0, 255, 0).astype(np.uint8), window=dst_win)
-            ctx.progress(f"Cutting {dst_path.name}", (r + h) / height)
+            ctx.progress(f"Cutting {dst_path.name} — part {n} of {len(blocks)}", n / len(blocks))
         factors = _overview_factors(width, height)
         if factors:  # internal overviews only speed up display; the pixels themselves are untouched
             dst.build_overviews(factors, Resampling.nearest if palette else Resampling.average)

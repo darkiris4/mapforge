@@ -59,6 +59,7 @@ class JobManager:
         self.s = settings
         self.pool = ThreadPoolExecutor(settings.workers, thread_name_prefix="job")
         self.lock = threading.Lock()
+        self._save_lock = threading.Lock()
         self.jobs: dict[str, dict] = {}
         self.cancel: dict[str, threading.Event] = {}
         for f in sorted(settings.jobs_dir.glob("*/job.json")):
@@ -73,11 +74,13 @@ class JobManager:
 
     # -- persistence -------------------------------------------------------------------
     def _save(self, j: dict) -> None:
-        d = self.s.jobs_dir / j["id"]
-        d.mkdir(parents=True, exist_ok=True)
-        tmp = d / "job.json.tmp"
-        tmp.write_text(json.dumps(j, indent=2))
-        tmp.replace(d / "job.json")
+        # Progress can arrive from a heartbeat thread while the job thread also saves.
+        with self._save_lock:
+            d = self.s.jobs_dir / j["id"]
+            d.mkdir(parents=True, exist_ok=True)
+            tmp = d / "job.json.tmp"
+            tmp.write_text(json.dumps(j, indent=2))
+            tmp.replace(d / "job.json")
 
     def list(self) -> list[dict]:
         return sorted(self.jobs.values(), key=lambda j: j["created"], reverse=True)
@@ -228,6 +231,7 @@ class JobManager:
         def progress(i: int, n: int):
             def cb(msg: str, frac: float | None = None):
                 j["message"] = msg
+                j["updated"] = time.time()  # "last activity" for the UI, even when the bar can't move
                 if frac is not None:
                     j["progress"] = round((i + frac) / n, 4)
                     j["layer_progress"] = round(frac, 4)

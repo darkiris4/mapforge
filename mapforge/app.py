@@ -7,6 +7,7 @@ import secrets
 import shutil
 import tarfile
 import threading
+import time
 import zipfile
 from pathlib import Path
 
@@ -104,14 +105,15 @@ def create_app(settings: Settings | None = None, allowed_hosts: set[str] | None 
 
     @app.get("/api/jobs")
     def list_jobs():
-        return [{k: v for k, v in j.items() if k != "log"} for j in jobs.list()]
+        now = time.time()  # lets the UI show "last activity N s ago" without trusting the browser clock
+        return [{**{k: v for k, v in j.items() if k != "log"}, "server_time": now} for j in jobs.list()]
 
     @app.get("/api/jobs/{jid}")
     def get_job(jid: str):
         j = jobs.get(jid)
         if not j:
             raise HTTPException(404, "unknown job")
-        return j
+        return {**j, "server_time": time.time()}
 
     @app.post("/api/jobs/{jid}/cancel")
     def cancel(jid: str):

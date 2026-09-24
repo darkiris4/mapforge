@@ -7,16 +7,52 @@ const openForm = {};   // job id -> "export" | "split" (inline form kept open ac
 const formVals = {};   // job id -> {root, sub, splitMb}
 let jobsCache = [];
 
+// Live timing for running jobs, refreshed every second by tickJobs() so it never looks frozen.
+// "Last update" shows the job is alive even while one slow download holds the bar still.
+let clockSkew = 0;  // server clock minus browser clock
+const STALL_S = 120;
+const serverNow = () => Date.now() / 1000 + clockSkew;
+
+const firstSeen = {};  // job id -> [time, progress] when this page first saw it running
 function jobTiming(j) {
-  const now = Date.now() / 1000;
   if (j.status === "running" && j.started) {
-    const el = now - j.started;
-    const eta = j.progress > 0.03 ? (el / j.progress) * (1 - j.progress) : null;
-    return `running ${fmtDur(el)}${eta !== null ? ` · about ${fmtDur(eta)} left` : ""}`;
+    const now = serverNow(), el = now - j.started;
+    // Rate since first seen, not since start: some phases jump the bar instantly and would
+    // make a whole-run average far too optimistic.
+    const [t0, p0] = (firstSeen[j.id] ||= [now, j.progress]);
+    const eta = now - t0 > 5 && j.progress > p0 ? ((1 - j.progress) * (now - t0)) / (j.progress - p0) : null;
+    return `running ${fmtDur(el)} · ${eta !== null ? `about ${fmtDur(eta)} left` : "working out time left…"}`;
   }
   if (j.finished && j.started) return `took ${fmtDur(j.finished - j.started)}`;
   return "";
 }
+function jobActivity(j) {
+  if (j.status !== "running" || !j.updated) return { text: "", stalled: false };
+  const age = Math.max(0, serverNow() - j.updated);
+  if (age >= STALL_S) {
+    return { stalled: true, text: `No activity for ${fmtDur(age)} — the map server may be slow or stuck. ` +
+      "You can keep waiting or Cancel; anything already downloaded is kept for next time." };
+  }
+  return { stalled: false, text: `Last update ${age < 5 ? "just now" : `${fmtDur(age)} ago`}` };
+}
+function tickJobs() {
+  if (!document.querySelector("#tab-jobs.active")) return;
+  for (const j of jobsCache) {
+    if (j.status !== "running") continue;
+    const card = document.querySelector(`.job[data-id="${CSS.escape(j.id)}"]`);
+    if (!card) continue;
+    const tm = card.querySelector("[data-timing]");
+    if (tm) tm.textContent = jobTiming(j);
+    const act = card.querySelector("[data-activity]");
+    if (act) {
+      const a = jobActivity(j);
+      act.textContent = a.text;
+      act.className = a.stalled ? "hint" : "muted";
+    }
+  }
+}
+setInterval(tickJobs, 1000);
+
 // Turn raw errors into something a sysadmin can act on; the original text stays available.
 function friendlyError(msg) {
   const m = String(msg || "");
@@ -77,7 +113,7 @@ function jobCardHTML(j) {
     <div class="head">
       <div><span class="title">${esc(j.name)}</span> <span class="st ${esc(j.status)}">${esc(statusWord[j.status] || j.status)}</span>
         <span class="tag">${esc(mode?.title || j.spec?.mode)}</span>
-        <span class="muted">${new Date(j.created * 1000).toLocaleString()} ${esc(jobTiming(j))}</span></div>
+        <span class="muted">${new Date(j.created * 1000).toLocaleString()} <span data-timing>${esc(jobTiming(j))}</span></span></div>
       <div class="row">
         ${ready ? `<a class="btn primary small" href="${esc(zip)}">Download .zip</a>` : ""}
         ${running ? `<button class="small" data-cancel="${esc(j.id)}">Cancel</button>`
@@ -85,6 +121,7 @@ function jobCardHTML(j) {
       </div>
     </div>
     <div class="muted">${esc(j.message)}</div>
+    ${running ? `<div class="${jobActivity(j).stalled ? "hint" : "muted"}" data-activity>${esc(jobActivity(j).text)}</div>` : ""}
     ${fe ? `<div class="hint">${esc(fe)}</div>` : ""}
     ${running ? `<div class="bar" title="overall"><div style="width:${(j.progress * 100).toFixed(1)}%"></div></div>
       ${cur ? `<div class="muted">Layer ${cur.index + 1} of ${cur.count}: ${esc(cur.name)}</div>
@@ -110,6 +147,7 @@ async function loadJobs() {
   let jobs;
   try { jobs = await api("/api/jobs"); } catch (e) { $("#jobs").innerHTML = `<p class="bad">${esc(e.message)}</p>`; return; }
   jobsCache = jobs;
+  if (jobs[0]?.server_time) clockSkew = jobs[0].server_time - Date.now() / 1000;
   const active = jobs.filter((j) => j.status === "running" || j.status === "queued").length;
   $("#jobBadge").textContent = active; $("#jobBadge").classList.toggle("hidden", !active);
   const box = $("#jobs");
