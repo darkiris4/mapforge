@@ -14,6 +14,12 @@ MapForge offers two ways to bring NGA and other controlled data into a package:
 > Label and store them accordingly. MapForge does not add or track markings for you. The
 > `README.txt` in each package lists the inputs so you can carry the markings forward.
 
+> **Status: untested.** This entire document is theoretical. None of it — the local-library
+> NGA product handling, the GEGD WMTS/WMS presets, PKI client-certificate auth, the DoD CA
+> bundle steps, or the PKCS#11 proxy approach in section 3 — has been exercised against a real
+> NGA account, GEGD endpoint, or CAC. Treat it as a starting point to validate against an actual
+> account and credentials, not as a verified procedure.
+
 ---
 
 ## 1. Local library (CADRG, CIB, ECRG, DTED, NITF, GeoTIFF)
