@@ -19,8 +19,19 @@ class ZipMember:
 
 def list_remote_zip(client: httpx.Client, url: str) -> list[ZipMember]:
     """Members of a remote zip, from its central directory."""
+    return remote_zip_info(client, url)[1]
+
+
+def remote_zip_info(client: httpx.Client, url: str) -> tuple[int | None, list[ZipMember]]:
+    """(total zip size in bytes or None, members) using only HTTP range requests."""
     r = client.get(url, headers={"Range": "bytes=-65536"})
     r.raise_for_status()
+    total = None
+    cr = r.headers.get("content-range", "")  # "bytes 123-456/789"
+    if "/" in cr and cr.rsplit("/", 1)[1].isdigit():
+        total = int(cr.rsplit("/", 1)[1])
+    elif r.status_code == 200:
+        total = len(r.content)
     tail = r.content
     eocd = tail.rfind(b"PK\x05\x06")
     if eocd < 0:
@@ -42,7 +53,7 @@ def list_remote_zip(client: httpx.Client, url: str) -> list[ZipMember]:
         off = struct.unpack("<I", cd[p + 42 : p + 46])[0]
         out.append(ZipMember(cd[p + 46 : p + 46 + nl].decode("utf-8", "replace"), usz, csz, method, off))
         p += 46 + nl + el + cl
-    return out
+    return total, out
 
 
 def read_remote_member(client: httpx.Client, url: str, m: ZipMember, max_bytes: int = 1 << 20) -> bytes:

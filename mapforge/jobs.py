@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import shutil
 import threading
@@ -21,7 +22,10 @@ from .sources import Cancelled, Context, registry
 # 96 dpi screen: one pixel ≈ 0.2646 mm, so a raster "looks native" at 1 : res_m / 0.0002646.
 PX_M = 0.0002645833
 # Observed throughput of USGS ImageServer exports (2000x2000 px, 4 in parallel): ~2 per minute.
+# (Estimates use the learned rate from mapforge.speeds once a server has been measured.)
 EXPORT_CHUNKS_PER_MIN = 2.0
+# Size of one 1°x1° DTED cell (int16 posts + headers) below 50° latitude, by level.
+DTED_CELL_MB = {0: 0.04, 1: 2.9, 2: 26.0}
 JOB_ID_RE = re.compile(r"\d{8}-\d{6}-[0-9a-f]{6}")
 
 
@@ -86,27 +90,73 @@ class JobManager:
         return bbox, layers, outputs
 
     def estimate(self, spec: dict) -> dict:
+        """Size and time of a job before running it: download (cache-aware, learned speeds)
+        and the package each layer produces in the chosen output mode."""
         bbox, layers, outputs = self.validate(spec)
+        mode = spec.get("mode") or "kongsberg"
         reg = registry(self.s)
+
+        def source_estimate(layer):
+            src = reg[layer["source"]]
+            res = float(layer.get("res_m") or src.default_res_m)
+            try:
+                return src.estimate(bbox, res, self.s)
+            except Exception as e:  # an estimate must never block building the job
+                return {"download_mb": 0.0, "cached_pct": 0, "requests": None, "download_seconds": 0,
+                        "speed_basis": "default", "notes": [f"Couldn't work out the download size ({e})."]}
+
+        with ThreadPoolExecutor(max(1, min(8, len(layers)))) as pool:
+            ests = list(pool.map(source_estimate, layers))
+
         rows = []
-        for layer in layers:
+        for layer, est in zip(layers, ests):
             src = reg[layer["source"]]
             res = float(layer.get("res_m") or src.default_res_m)
             g = grid_for(bbox, res)
             bpp = 4 if src.kind == "elevation" else 3
             ratio = 0.08 if (src.kind == "rgb" and src.resampling != "nearest") else 0.3
+            est_mb = round(g.pixels * bpp * ratio * 1.33 / 1e6, 1)
             row = {"source": src.id, "name": src.name, "res_m": res, "width": g.width, "height": g.height,
-                   "megapixels": round(g.pixels / 1e6, 1),
-                   "est_mb": round(g.pixels * bpp * ratio * 1.33 / 1e6, 1),
-                   "too_big": g.pixels > self.s.max_pixels}
+                   "megapixels": round(g.pixels / 1e6, 1), "est_mb": est_mb,
+                   "too_big": g.pixels > self.s.max_pixels,
+                   "download_mb": est["download_mb"], "cached_pct": est["cached_pct"],
+                   "download_seconds": est["download_seconds"],
+                   "package_mb": self._package_mb(mode, src, est, est_mb, outputs, bbox),
+                   "speed_basis": est["speed_basis"], "notes": list(est["notes"])}
+            if est.get("requests") is not None:
+                row["requests"] = est["requests"]
             if hasattr(src, "chunk_count"):  # server-side exports (ArcGIS ImageServer) are slow per request
-                n = src.chunk_count(bbox, res)
-                row["requests"] = n
-                row["fetch_minutes"] = round(n / EXPORT_CHUNKS_PER_MIN)
+                row.setdefault("requests", src.chunk_count(bbox, res))
+                row["fetch_minutes"] = round(est["download_seconds"] / 60)
+            if row["too_big"] and mode == "kongsberg":
+                row["notes"].append("Too big to build at this detail level — choose a coarser one or a smaller area.")
             rows.append(row)
         w, h = bbox.size_m()
+        total_pkg = round(sum(r["package_mb"] for r in rows), 1)
         return {"area_km": [round(w / 1000, 1), round(h / 1000, 1)], "layers": rows,
-                "total_mb": round(sum(r["est_mb"] for r in rows), 1)}
+                "total_download_mb": round(sum(r["download_mb"] for r in rows), 1),
+                # Layers are processed one after another, so the times add up.
+                "total_download_seconds": int(sum(r["download_seconds"] for r in rows)),
+                "total_package_mb": total_pkg, "total_mb": total_pkg}
+
+    @staticmethod
+    def _package_mb(mode: str, src, est: dict, est_mb: float, outputs: OutputOptions, bbox: BBox) -> float:
+        """Approximate size this layer adds to the package."""
+        if mode == "original":
+            v = est.get("source_mb", est.get("clipped_mb"))
+            return round(v if v is not None else est_mb, 1)
+        if mode == "clipped":
+            v = est.get("clipped_mb")
+            return round(v if v is not None else est_mb, 1)
+        rasters = int(outputs.geotiff) + int(outputs.cog)
+        if outputs.mbtiles and src.kind == "rgb":
+            rasters += 1.1  # Web-Mercator tile pyramid, a bit bigger than one GeoTIFF
+        mb = est_mb * rasters
+        if src.kind == "elevation" and outputs.dted_level is not None:
+            cells = ((math.ceil(bbox.east) - math.floor(bbox.west))
+                     * (math.ceil(bbox.north) - math.floor(bbox.south)))
+            mb += cells * DTED_CELL_MB.get(int(outputs.dted_level), 3.0)
+        return round(mb, 1)
 
     # -- run ---------------------------------------------------------------------------
     def submit(self, spec: dict) -> dict:

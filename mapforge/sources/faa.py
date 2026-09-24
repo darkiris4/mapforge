@@ -20,9 +20,10 @@ from pathlib import Path
 import rasterio
 from rasterio.warp import transform_bounds
 
+from .. import speeds
 from ..geo import BBox
-from .base import Context, Item, Source
-from .ziputil import list_remote_zip, read_remote_member
+from .base import Context, Item, Source, _level, cached_note, estimate_result, plain_duration, speed_note
+from .ziputil import list_remote_zip, read_remote_member, remote_zip_info
 
 PAGES = {
     "vfr": "https://www.faa.gov/air_traffic/flight_info/aeronav/digital_products/vfr/",
@@ -100,6 +101,39 @@ def _fgdc_bounds(text: str) -> list[float] | None:
     return [vals["West"], vals["South"], vals["East"], vals["North"]]
 
 
+# Plain-language names for people who don't work with aeronautical charts every day.
+PLAIN = {
+    "faa-sectional": ("vfr", "VFR sectional charts (1:500k)",
+                      "The standard low-altitude pilot chart: airports, airspace, terrain and landmarks. "
+                      "The usual choice for a general aviation map."),
+    "faa-tac": ("vfr", "VFR terminal area charts (1:250k)",
+                "Twice the detail of a sectional, but only around major airports (Class B airspace)."),
+    "faa-flyway": ("vfr", "VFR flyway planning charts",
+                   "Suggested VFR routes through the busy airspace around major airports."),
+    "faa-heli": ("vfr", "Helicopter route charts",
+                 "Very detailed charts of helicopter routes and landmarks over large cities."),
+    "faa-caribbean": ("vfr", "VFR Caribbean charts",
+                      "VFR pilot charts for Puerto Rico, the Virgin Islands and the wider Caribbean."),
+    "faa-grand-canyon": ("vfr", "VFR Grand Canyon chart",
+                         "Special VFR chart for the Grand Canyon air-tour area."),
+    "faa-ifr-low": ("ifr", "IFR low-altitude enroute charts",
+                    "Instrument charts for flights below 18,000 ft: airways, navigation aids and minimum altitudes."),
+    "faa-ifr-high": ("ifr", "IFR high-altitude enroute charts",
+                     "Instrument charts for the jet routes flown at 18,000 ft and above."),
+    "faa-ifr-area": ("ifr", "IFR area charts",
+                     "Close-up instrument charts of the airways around busy terminal areas."),
+    "faa-ifr-alaska": ("ifr", "IFR enroute charts — Alaska",
+                       "Low- and high-altitude instrument charts for Alaska."),
+    "faa-ifr-pacific": ("ifr", "IFR enroute charts — Pacific",
+                        "Instrument charts for Hawaii and the Pacific islands."),
+    "faa-ifr-oceanic": ("ifr", "IFR oceanic route charts",
+                        "Long-range route charts over the North Atlantic, North Pacific and West Atlantic."),
+}
+FAA_HOST_KEY = "bytes:aeronav.faa.gov"
+SECONDS_PER_NEW_CHART = 3.0  # unzip + neatline detection after download
+TYPICAL_ZIP_BYTES = 60e6  # a sectional zip; used only if the size probe fails
+
+
 class FaaSource(Source):
     group = "Aeronautical — FAA (public)"
     kind = "rgb"
@@ -114,6 +148,86 @@ class FaaSource(Source):
         self.description = product.description
         self.default_res_m = product.default_res_m
         self.min_res_m = product.default_res_m / 2
+        self.category, self.plain_name, self.explain = PLAIN.get(
+            product.id, ("ifr" if product.page == "ifr" else "vfr", product.name, product.description))
+
+    def detail_levels(self) -> list[dict]:
+        d = self.default_res_m
+        return [_level("overview", "Lighter download", d * 2,
+                       "Half the pixels in each direction; small print gets hard to read"),
+                _level("native", "Full chart detail", d, "Exactly as printed — every label readable")]
+
+    # -- estimate ------------------------------------------------------------------
+    def _sizes(self, settings, urls: list[str]) -> dict:
+        """{zip url: {"zip": bytes, "members": {name: bytes}}}, cached in cache/faa/sizes.json."""
+        path = settings.cache_dir / "faa" / "sizes.json"
+        with _lock:
+            sizes = json.loads(path.read_text()) if path.exists() else {}
+        missing = [u for u in urls if u not in sizes]
+        if missing:
+            ctx = Context(settings)
+
+            def probe(url):
+                try:
+                    with ctx.http(timeout=20) as c:
+                        total, members = remote_zip_info(c, url)
+                    return url, {"zip": total, "members": {m.name: m.size for m in members}}
+                except Exception:
+                    return url, None
+
+            with ThreadPoolExecutor(12) as pool:
+                found = {u: v for u, v in pool.map(probe, missing) if v}
+            if found:
+                with _lock:
+                    sizes = json.loads(path.read_text()) if path.exists() else {}
+                    sizes.update(found)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(json.dumps(sizes, indent=1))
+        return sizes
+
+    def estimate(self, bbox: BBox, res_m: float, settings) -> dict:
+        entries = [e for e in self._index(Context(settings)) if bbox.intersects(BBox(*e["bbox"]))]
+        if not entries:
+            return estimate_result(cached_pct=100, notes=["No charts of this type cover this area."])
+        sizes = self._sizes(settings, sorted({e["url"] for e in entries}))
+        rate, basis = speeds.get(settings, FAA_HOST_KEY)
+        todo_bytes = total_bytes = source_bytes = clipped_bytes = 0.0
+        new_charts = 0
+        counted: set[str] = set()
+        to_get: set[str] = set()
+        for e in entries:
+            info = sizes.get(e["url"]) or {}
+            zip_bytes = float(info.get("zip") or TYPICAL_ZIP_BYTES)
+            member_bytes = float((info.get("members") or {}).get(e["member"]) or zip_bytes)
+            folder = settings.cache_dir / "faa" / e["edition"]
+            extracted = (folder / Path(e["member"]).name).exists()
+            zip_local = (folder / e["url"].rsplit("/", 1)[1]).exists()
+            if e["url"] not in counted:  # several charts can share one zip
+                counted.add(e["url"])
+                total_bytes += zip_bytes
+            if not extracted:
+                new_charts += 1
+                if not zip_local and e["url"] not in to_get:
+                    to_get.add(e["url"])
+                    todo_bytes += zip_bytes
+            source_bytes += member_bytes
+            fp = BBox(*e["bbox"])
+            inter = bbox.intersection(fp)
+            if inter:
+                frac = ((inter.east - inter.west) * (inter.north - inter.south)
+                        / ((fp.east - fp.west) * (fp.north - fp.south)))
+                clipped_bytes += member_bytes * frac
+        cached_pct = 100.0 * (1 - todo_bytes / total_bytes) if total_bytes else 100.0
+        seconds = todo_bytes / rate + new_charts * SECONDS_PER_NEW_CHART
+        n = len(entries)
+        notes = [f"{n} chart sheet{'s cover' if n != 1 else ' covers'} this area"
+                 + (f"; {len(to_get)} to download (~{todo_bytes / 1e6:.0f} MB, {plain_duration(seconds)})."
+                    if to_get else ".")]
+        notes += cached_note(cached_pct, todo_bytes)
+        if to_get:
+            notes += speed_note(basis)
+        return estimate_result(todo_bytes, cached_pct, len(to_get), seconds, notes, basis,
+                               source_bytes=source_bytes, clipped_bytes=clipped_bytes)
 
     def has_coverage(self) -> bool:
         return True
