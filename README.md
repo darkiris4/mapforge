@@ -117,6 +117,36 @@ The `verify-map-output` project skill renders a contact sheet for exactly that.
 Compression is lossless (deflate) for charts and elevation and JPEG q90 for imagery. You can
 override this per layer through the API (`compression`: `jpeg|deflate|lzw|none`).
 
+## Delivering packages
+
+Every finished package has a `SHA256SUMS` file covering all its files. After moving a package,
+prove it arrived intact with `sha256sum -c SHA256SUMS` in the package folder (Windows:
+`certutil -hashfile <file> SHA256` and compare).
+
+From the Jobs page you can:
+
+| Option | What you get |
+|---|---|
+| **Download zip** | The whole package as one zip. |
+| **Download one layer** | A zip of a single layer folder plus the package README, manifest and `SHA256SUMS`. |
+| **Save to folder** | A copy of the package folder written into a folder on the MapForge server, for example a mounted network share. The copy is checksum-verified after writing. Only folders under `MAPFORGE_EXPORT_DIRS` are allowed (default `data/exports`). An existing non-empty package folder is only replaced if you tick *overwrite*. |
+| **Split for removable media** | The package zip cut into fixed-size parts (`name.zip.001`, `.002`, …): CD 700 MB, DVD 4.7 GB, FAT32 USB 4 GB, BD-R 25 GB or a custom size. Each split comes with a `SHA256SUMS` for the parts and the joined zip, plus `JOIN-README.txt`. |
+
+Joining split parts on the target machine (also in `JOIN-README.txt`):
+
+```bash
+cat name.zip.* > name.zip && sha256sum -c SHA256SUMS && unzip name.zip       # Linux / macOS
+```
+```bat
+copy /b name.zip.001+name.zip.002 name.zip                                     :: Windows
+```
+Or open `name.zip.001` in 7-Zip, which reads the other parts automatically.
+
+API: `GET /api/jobs/{id}/download[?layer=<folder>]`, `GET /api/export-roots`,
+`POST /api/jobs/{id}/export {"dest": "/abs/path", "overwrite": false}`,
+`POST /api/jobs/{id}/split {"part_mb": 4095}`, `GET /api/jobs/{id}/parts/{file}`. Exports and splits
+run in the background; their state is in the job's `deliveries` list.
+
 ## Loading into Kongsberg TerraLens
 
 Everything is plain, standard data, so TerraLens should read it with its standard raster and
@@ -142,6 +172,7 @@ elevation data sources. In short:
 | `MAPFORGE_TOKEN` | – | unset | When set, every `/api` call needs the header `X-MapForge-Token` (the UI prompts for it once). |
 | `MAPFORGE_MAX_PIXELS` | – | `2000000000` | Per-layer pixel limit. Larger requests are refused with a hint. |
 | `MAPFORGE_WORKERS` | – | `2` | Jobs processed concurrently. |
+| `MAPFORGE_EXPORT_DIRS` | – | `$MAPFORGE_DATA/exports` | Folders a finished package may be copied into ("Save to folder"), `:`-separated, e.g. mounted shares. Nothing outside them can be written. |
 | `MAPFORGE_USER_AGENT` | – | `MapForge/0.1 …` | User-Agent sent to data providers. |
 
 MapForge has no user accounts. Treat it as a single-team tool: keep it on a trusted network,

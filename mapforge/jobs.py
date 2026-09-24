@@ -12,6 +12,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from . import delivery
 from .geo import BBox, grid_for
 from .process import LayerOptions, OutputOptions, build_layer
 from .settings import Settings
@@ -42,6 +43,7 @@ class JobManager:
                 continue
             if j["status"] in ("queued", "running"):
                 j["status"], j["message"] = "failed", "Interrupted by a server restart — resubmit the job."
+            delivery.fail_interrupted(j)
             self.jobs[j["id"]] = j
 
     # -- persistence -------------------------------------------------------------------
@@ -113,7 +115,7 @@ class JobManager:
         name = _safe(spec.get("name") or "area")
         j = {"id": jid, "name": name, "created": time.time(), "status": "queued", "message": "Queued",
              "progress": 0.0, "spec": {**spec, "bbox": list(bbox.as_tuple())}, "layers": [], "log": [],
-             "package": None}
+             "package": None, "deliveries": []}
         with self.lock:
             self.jobs[jid] = j
             self.cancel[jid] = threading.Event()
@@ -183,6 +185,9 @@ class JobManager:
             self._write_manifest(j, pkg, bbox)
             ok = [x for x in j["layers"] if x["status"] == "ok"]
             failed = [x for x in j["layers"] if x["status"] == "failed"]
+            if ok:  # last, so it covers the manifest and README too
+                j["message"] = "Writing checksums (SHA256SUMS)…"
+                delivery.write_checksums(pkg)
             j["status"] = "done" if ok and not failed else "partial" if ok else "failed"
             j["message"] = (f"{len(ok)} layer(s) ready" + (f", {len(failed)} failed" if failed else "")
                             if ok else "No layers produced — see layer messages")
@@ -233,9 +238,11 @@ class JobManager:
         ]
         (pkg / "README.txt").write_text("\n".join(lines) + "\n")
 
-    def zip_path(self, jid: str) -> Path:
+    def zip_path(self, jid: str, layer: str | None = None) -> Path:
         j = self.jobs[jid]
         pkg = Path(j["package"])
+        if layer is not None:  # one layer folder (+ README/manifest/SHA256SUMS)
+            return delivery.layer_zip(pkg, layer, self.s.jobs_dir / jid / "layers", j.get("finished", 0))
         z = pkg.with_suffix(".zip")
         if not z.exists() or z.stat().st_mtime < j.get("finished", 0):
             tmp = z.with_suffix(".zip.part")

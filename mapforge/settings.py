@@ -15,6 +15,8 @@ def _paths(value: str) -> list[Path]:
 class Settings:
     data_dir: Path = field(default_factory=lambda: Path(os.environ.get("MAPFORGE_DATA", "./data")).expanduser().resolve())
     library_dirs: list[Path] = field(default_factory=list)
+    # Folders a finished package may be copied into ("export to folder"), e.g. mounted shares.
+    export_dirs: list[Path] = field(default_factory=list)
     max_pixels: int = int(os.environ.get("MAPFORGE_MAX_PIXELS", str(2_000_000_000)))
     workers: int = int(os.environ.get("MAPFORGE_WORKERS", "2"))
     user_agent: str = os.environ.get("MAPFORGE_USER_AGENT", "MapForge/0.1 (self-hosted map packager)")
@@ -24,8 +26,15 @@ class Settings:
     def __post_init__(self) -> None:
         if not self.library_dirs:
             self.library_dirs = _paths(os.environ.get("MAPFORGE_LIBRARY", "")) or [self.data_dir / "library"]
+        if not self.export_dirs:
+            self.export_dirs = _paths(os.environ.get("MAPFORGE_EXPORT_DIRS", "")) or [self.data_dir / "exports"]
         for d in (self.cache_dir, self.jobs_dir, self.config_dir, *self.library_dirs):
             d.mkdir(parents=True, exist_ok=True)
+        for d in self.export_dirs:
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass  # e.g. a share that isn't mounted yet; exports there fail with a clear error
 
     @property
     def cache_dir(self) -> Path:
