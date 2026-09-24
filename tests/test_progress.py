@@ -149,3 +149,62 @@ def test_estimate_reports_export_requests(settings):
     assert row["requests"] >= 300 and row["fetch_minutes"] == round(row["requests"] / EXPORT_CHUNKS_PER_MIN)
     spec["layers"][0]["res_m"] = 4
     assert jm.estimate(spec)["layers"][0]["requests"] <= row["requests"] / 12
+
+
+class TimeoutOnBigExports(SlowFirstChunkServer):
+    """Returns 504 for exports whose edge is >= limit px (a busy ImageServer), else a TIFF."""
+
+    def __init__(self, limit: int):
+        super().__init__(slow_s=0)
+        self.limit, self.calls = limit, []
+
+    def get(self, url, params=None):
+        w, h = (int(v) for v in params["size"].split(","))
+        self.calls.append((w, h))
+        if max(w, h) >= self.limit:
+            class R504:
+                status_code = 504
+                headers = {"content-type": "text/html"}
+                content = b"<html>504 Gateway Time-out</html>"
+            return R504()
+        return super().get(url, params)
+
+
+def test_export_splits_on_gateway_timeout_and_resumes(settings, monkeypatch):
+    monkeypatch.setattr(ArcGISImageServer, "CHUNK", 2000)
+    monkeypatch.setattr(ArcGISImageServer, "MIN_SPLIT", 500)
+    monkeypatch.setattr(ArcGISImageServer, "RETRY_DELAYS_S", (0, 0, 0))
+    src = ArcGISImageServer("t", "T", "https://example.invalid/ImageServer", "g", default_res_m=1)
+    bbox = BBox(0.0, 0.0, 0.017, 0.017)  # ~1890 px at 1 m -> a single chunk
+    assert src.chunk_count(bbox, 1) == 1
+    ctx = FakeHttpContext(settings, progress=Recorder())
+    ctx.server = TimeoutOnBigExports(limit=1000)
+    items = src.items(bbox, 1, ctx)
+    assert len(items) == 4  # 1 chunk -> quartered after 3 x 504
+    assert sum(1 for c in ctx.server.calls if max(c) >= 1000) == 3
+    # Quarters tile the chunk exactly.
+    assert min(i.footprint.west for i in items) == 0.0 and max(i.footprint.east for i in items) == 0.017
+    # Re-run: goes straight to the cached quarters, never re-asks for the big export.
+    ctx.server = TimeoutOnBigExports(limit=1000)
+    assert len(src.items(bbox, 1, ctx)) == 4 and ctx.server.calls == []
+
+
+def test_export_failure_says_how_much_is_cached(settings, monkeypatch):
+    monkeypatch.setattr(ArcGISImageServer, "CHUNK", 400)
+    monkeypatch.setattr(ArcGISImageServer, "MIN_SPLIT", 500)  # 400 px chunks can't be split further
+    monkeypatch.setattr(ArcGISImageServer, "RETRY_DELAYS_S", (0, 0))
+    monkeypatch.setattr(ArcGISImageServer, "WORKERS", 1)
+    src = ArcGISImageServer("t", "T", "https://example.invalid/ImageServer", "g", default_res_m=1)
+    bbox = BBox(0.0, 0.0, 0.0071, 0.0035)  # ~790x390 px -> 2 chunks of <=400 px side by side
+    assert src.chunk_count(bbox, 1) == 2
+
+    class FailSecond(TimeoutOnBigExports):
+        def get(self, url, params=None):
+            self.calls.append(params["bbox"])
+            return super().get(url, params) if len(set(self.calls)) == 1 else \
+                type("R", (), {"status_code": 504, "headers": {}, "content": b""})()
+
+    ctx = FakeHttpContext(settings, progress=Recorder())
+    ctx.server = FailSecond(limit=10_000)
+    with pytest.raises(RuntimeError, match=r"1/2 chunks are cached; run the job again"):
+        src.items(bbox, 1, ctx)
