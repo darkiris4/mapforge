@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>MapForge</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%232f6f5e'/%3E%3Cpath d='M6 23l6-12 5 8 3-5 6 9z' fill='%23fff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="vendor/leaflet/leaflet.css">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header>
+  <div class="brand"><span class="logo">▲</span> MapForge <span class="sub">fetch · bound · convert</span></div>
+  <nav>
+    <button data-tab="build" class="active">Build</button>
+    <button data-tab="jobs">Jobs <span id="jobBadge" class="badge hidden"></span></button>
+    <button data-tab="endpoints">Endpoints / NGA</button>
+    <button data-tab="library">Local library</button>
+  </nav>
+</header>
+
+<main>
+  <!-- BUILD ------------------------------------------------------------------------------>
+  <section id="tab-build" class="tab active">
+    <aside class="panel">
+      <div class="card">
+        <h3>1 · Area</h3>
+        <div class="row">
+          <button id="drawBtn" class="primary">▭ Draw box</button>
+          <button id="viewBtn">Use map view</button>
+        </div>
+        <div class="grid4">
+          <label>West<input id="bW" type="number" step="any"></label>
+          <label>South<input id="bS" type="number" step="any"></label>
+          <label>East<input id="bE" type="number" step="any"></label>
+          <label>North<input id="bN" type="number" step="any"></label>
+        </div>
+        <details>
+          <summary>Center + radius / paste coordinates</summary>
+          <div class="grid3">
+            <label>Lat<input id="cLat" type="number" step="any" placeholder="38.85"></label>
+            <label>Lon<input id="cLon" type="number" step="any" placeholder="-77.04"></label>
+            <label>Radius NM<input id="cRad" type="number" step="any" value="10"></label>
+          </div>
+          <button id="centerBtn">Set box from center</button>
+          <label>Paste “W,S,E,N”<input id="paste" placeholder="-77.15, 38.80, -76.95, 38.95"></label>
+        </details>
+        <div id="areaInfo" class="muted"></div>
+      </div>
+
+      <div class="card">
+        <h3>2 · Layers</h3>
+        <input id="srcFilter" placeholder="Filter sources…">
+        <div id="sources"></div>
+      </div>
+
+      <div class="card">
+        <h3>3 · Outputs</h3>
+        <div class="checks">
+          <label><input type="checkbox" id="oTif" checked> GeoTIFF (EPSG:4326, tiled + overviews)</label>
+          <label><input type="checkbox" id="oCog"> Cloud-Optimized GeoTIFF</label>
+          <label><input type="checkbox" id="oMbt"> MBTiles (web / mobile viewers)</label>
+          <label>DTED from elevation layers
+            <select id="oDted"><option value="">none</option><option value="0">Level 0 (30″)</option>
+              <option value="1" selected>Level 1 (3″ ≈ 90 m)</option><option value="2">Level 2 (1″ ≈ 30 m)</option></select>
+          </label>
+        </div>
+        <label>Package name<input id="jobName" placeholder="e.g. DCA_training_area"></label>
+        <div id="estimate" class="muted"></div>
+        <button id="buildBtn" class="primary big" disabled>Build package</button>
+      </div>
+    </aside>
+    <div class="mapwrap">
+      <div id="map"></div>
+      <div class="maptools">
+        <select id="basemap">
+          <option value="osm">OpenStreetMap</option>
+          <option value="usgs">USGS imagery</option>
+          <option value="topo">USGS topo</option>
+          <option value="none">None (offline)</option>
+        </select>
+      </div>
+      <div id="legend" class="legend hidden" aria-label="Coverage legend"></div>
+    </div>
+  </section>
+
+  <!-- JOBS -------------------------------------------------------------------------------->
+  <section id="tab-jobs" class="tab">
+    <div class="page">
+      <h2>Jobs</h2>
+      <div id="jobs"></div>
+    </div>
+  </section>
+
+  <!-- ENDPOINTS ---------------------------------------------------------------------------->
+  <section id="tab-endpoints" class="tab">
+    <div class="page two">
+      <div>
+        <h2>Controlled &amp; custom endpoints</h2>
+        <p class="muted">Connect NGA GEGD, agency ArcGIS servers or commercial tile services. Anything you can
+          open in a browser or GIS with a certificate can be added here using a PEM client certificate + key
+          stored on this server. Credentials never leave this machine.</p>
+        <div id="endpoints"></div>
+      </div>
+      <form id="epForm" class="card">
+        <h3 id="epTitle">Add endpoint</h3>
+        <label>Start from preset<select id="epPreset"><option value="">—</option></select></label>
+        <p id="epHint" class="hint"></p>
+        <input type="hidden" name="id">
+        <label>Name<input name="name" required placeholder="GEGD Maxar WMTS"></label>
+        <label>Type<select name="type" id="epType"></select></label>
+        <label>URL<input name="url" required placeholder="https://…"></label>
+        <div class="grid2">
+          <label>Layer<input name="layer" placeholder="(WMS/WMTS)"></label>
+          <label>Tile matrix set<input name="tile_matrix_set" placeholder="(WMTS, optional)"></label>
+          <label>Max zoom<input name="max_zoom" type="number" value="19"></label>
+          <label>Default res (m)<input name="default_res_m" type="number" step="any" value="1"></label>
+          <label>Kind<select name="kind"><option value="rgb">Imagery / chart</option><option value="elevation">Elevation</option></select></label>
+          <label>Group<input name="group" placeholder="NGA / controlled (PKI)"></label>
+        </div>
+        <fieldset>
+          <legend>Authentication</legend>
+          <label>Type<select name="auth.type" id="authType">
+            <option value="none">None</option><option value="pki">PKI client certificate</option>
+            <option value="basic">Username / password</option><option value="header">HTTP header / token</option></select></label>
+          <div data-auth="pki">
+            <label>Certificate (PEM path on server)<input name="auth.cert" placeholder="~/.pki/me.crt.pem"></label>
+            <label>Private key (PEM path)<input name="auth.key" placeholder="~/.pki/me.key.pem"></label>
+            <label>Key password<input name="auth.key_password" type="password" autocomplete="off"></label>
+          </div>
+          <div data-auth="basic">
+            <label>Username<input name="auth.username" autocomplete="off"></label>
+            <label>Password<input name="auth.password" type="password" autocomplete="off"></label>
+          </div>
+          <div data-auth="header"><label>Header<input name="auth.header" placeholder="Authorization: Bearer …"></label></div>
+          <label>CA bundle (e.g. DoD root CAs, PEM)<input name="auth.ca_bundle" placeholder="/etc/ssl/dod/DoD_PKE_CA_chain.pem"></label>
+        </fieldset>
+        <div class="row">
+          <button type="button" id="epTest">Test connection</button>
+          <button type="submit" class="primary">Save</button>
+          <button type="button" id="epReset">Clear</button>
+        </div>
+        <div id="epResult" class="muted"></div>
+      </form>
+    </div>
+  </section>
+
+  <!-- LIBRARY ----------------------------------------------------------------------------->
+  <section id="tab-library" class="tab">
+    <div class="page">
+      <h2>Local library</h2>
+      <p class="muted">Put NGA products you downloaded (CADRG/CIB folders with <code>A.TOC</code>, ECRG
+        <code>TOC.xml</code>, DTED <code>.dt0/.dt1/.dt2</code>, NITF, GeoTIFF, JPEG 2000) in a library directory, or
+        upload a zip/tar here, then rescan. Each product shows up as a layer under “Local library”.</p>
+      <div class="card">
+        <div><b>Library directories:</b> <span id="libDirs"></span></div>
+        <div class="row">
+          <button id="rescanBtn" class="primary">Rescan</button>
+          <label class="upload">Upload archive / file<input type="file" id="uploadFile"></label>
+          <span id="libStatus" class="muted"></span>
+        </div>
+        <div id="uploadBar" class="bar hidden"><div style="width:0"></div></div>
+      </div>
+      <table id="libTable"><thead><tr><th>Product</th><th>Kind</th><th>Files</th></tr></thead><tbody></tbody></table>
+    </div>
+  </section>
+</main>
+
+<div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+<script src="vendor/leaflet/leaflet.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

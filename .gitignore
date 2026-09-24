@@ -3,4 +3,8 @@ data/
 __pycache__/
 *.pyc
 .pytest_cache/
-.claude/
+.claude/worktrees/
+.claude/settings.local.json
+*.egg-info/
+build/
+dist/
