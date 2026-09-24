@@ -59,7 +59,13 @@ def custom_sources(settings) -> list[Source]:
     out = []
     for ep in settings.load_json("endpoints.json", []):
         try:
-            out.append(endpoint_to_source(ep))
+            src = endpoint_to_source(ep)
         except Exception:
             continue
+        src.category = "custom"
+        src.plain_name = ep["name"]
+        src.explain = ep.get("description") or (
+            "A map service you added on the Endpoints tab"
+            + (" (uses your certificate)." if src.access == "pki" else "."))
+        out.append(src)
     return out
