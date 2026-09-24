@@ -10,7 +10,7 @@ import json
 import math
 import shutil
 from contextlib import ExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -413,6 +413,16 @@ def plan_resolution(source: Source, items: list[Item], opts: LayerOptions) -> fl
     return min(natives) if natives else source.default_res_m
 
 
+FETCH_SHARE = 0.4  # share of a layer's progress bar given to downloading its inputs
+
+
+def _phase(ctx: Context, lo: float, hi: float) -> Context:
+    """A Context whose 0..1 progress fractions land in [lo, hi] of the layer's bar."""
+    def progress(msg: str, frac: float | None = None) -> None:
+        ctx.progress(msg, None if frac is None else lo + (hi - lo) * min(max(frac, 0.0), 1.0))
+    return replace(ctx, progress=progress)
+
+
 def _summarise_inputs(items: list[Item]) -> list[str]:
     labels = sorted({i.label or Path(i.path).name for i in items})
     return labels if len(labels) <= 12 else labels[:10] + [f"… and {len(labels) - 10} more"]
@@ -420,8 +430,12 @@ def _summarise_inputs(items: list[Item]) -> list[str]:
 
 def build_layer(source: Source, bbox: BBox, lopts: LayerOptions, oopts: OutputOptions, out_dir: Path,
                 ctx: Context, layer_name: str) -> dict:
-    ctx.progress(f"{source.name}: locating data", None)
-    items = source.items(bbox, lopts.res_m or source.default_res_m, ctx)
+    # A layer's progress runs 0→1 across phases: fetching inputs, rendering, DTED.
+    want_tif = oopts.geotiff or oopts.cog or (oopts.mbtiles and source.kind == "rgb")
+    want_dted = source.kind == "elevation" and oopts.dted_level is not None
+    render_end = 0.9 if (want_tif and want_dted) else 1.0
+    ctx.progress(f"{source.name}: locating data", 0.0)
+    items = source.items(bbox, lopts.res_m or source.default_res_m, _phase(ctx, 0.0, FETCH_SHARE))
     if not items:
         return {"source": source.id, "name": source.name, "status": "empty",
                 "message": "No data from this source intersects the area."}
@@ -448,8 +462,8 @@ def build_layer(source: Source, bbox: BBox, lopts: LayerOptions, oopts: OutputOp
         tif = out_dir / f"{layer_name}.tif"
         need_tif = oopts.geotiff or oopts.cog or (oopts.mbtiles and source.kind == "rgb")
         if need_tif:
-            stats = write_geotiff(tif, opened, source.kind, grid, lopts, source.resampling, ctx,
-                                  oopts.overviews, source.name)
+            stats = write_geotiff(tif, opened, source.kind, grid, lopts, source.resampling,
+                                  _phase(ctx, FETCH_SHARE, render_end), oopts.overviews, source.name)
             result.update(stats)
             if oopts.cog:
                 ctx.progress(f"{source.name}: writing COG", None)
@@ -465,6 +479,7 @@ def build_layer(source: Source, bbox: BBox, lopts: LayerOptions, oopts: OutputOp
                 tif.unlink()
         if source.kind == "elevation" and oopts.dted_level is not None:
             level = int(oopts.dted_level)
+            dted_start = render_end if want_tif else FETCH_SHARE
             dted_bbox = _dted_bbox(bbox)
             dted_opened = opened
             if not _covers([i.footprint for i in items], dted_bbox):
@@ -472,10 +487,13 @@ def build_layer(source: Source, bbox: BBox, lopts: LayerOptions, oopts: OutputOp
                 # cells are whole degrees, so fetch the expanded area at DTED post spacing.
                 ctx.progress(f"{source.name}: fetching whole-degree area for DTED{level}", None)
                 spacing_m = DTED_SPACING_M[level]
-                d_items = source.items(dted_bbox, max(spacing_m, getattr(source, "min_res_m", 0) or 0), ctx)
+                d_items = source.items(dted_bbox, max(spacing_m, getattr(source, "min_res_m", 0) or 0),
+                                       _phase(ctx, dted_start, dted_start + (1.0 - dted_start) / 2))
+                dted_start += (1.0 - dted_start) / 2
                 with rasterio.Env(**{k: v for i in d_items for k, v in i.gdal_env.items()}):
                     dted_opened = [o for o in (open_item(i, source.kind, spacing_m, stack) for i in d_items) if o]
-            result["files"] += write_dted(out_dir, dted_opened, bbox, level, ctx, source.name)
+            result["files"] += write_dted(out_dir, dted_opened, bbox, level, _phase(ctx, dted_start, 1.0),
+                                          source.name)
     for aux in out_dir.glob("*.aux.xml"):
         aux.unlink()
     result["status"] = "ok"

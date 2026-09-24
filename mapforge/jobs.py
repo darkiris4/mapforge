@@ -19,6 +19,8 @@ from .sources import Cancelled, Context, registry
 
 # 96 dpi screen: one pixel ≈ 0.2646 mm, so a raster "looks native" at 1 : res_m / 0.0002646.
 PX_M = 0.0002645833
+# Observed throughput of USGS ImageServer exports (2000x2000 px, 4 in parallel): ~2 per minute.
+EXPORT_CHUNKS_PER_MIN = 2.0
 JOB_ID_RE = re.compile(r"\d{8}-\d{6}-[0-9a-f]{6}")
 
 
@@ -91,10 +93,15 @@ class JobManager:
             g = grid_for(bbox, res)
             bpp = 4 if src.kind == "elevation" else 3
             ratio = 0.08 if (src.kind == "rgb" and src.resampling != "nearest") else 0.3
-            rows.append({"source": src.id, "name": src.name, "res_m": res, "width": g.width, "height": g.height,
-                         "megapixels": round(g.pixels / 1e6, 1),
-                         "est_mb": round(g.pixels * bpp * ratio * 1.33 / 1e6, 1),
-                         "too_big": g.pixels > self.s.max_pixels})
+            row = {"source": src.id, "name": src.name, "res_m": res, "width": g.width, "height": g.height,
+                   "megapixels": round(g.pixels / 1e6, 1),
+                   "est_mb": round(g.pixels * bpp * ratio * 1.33 / 1e6, 1),
+                   "too_big": g.pixels > self.s.max_pixels}
+            if hasattr(src, "chunk_count"):  # server-side exports (ArcGIS ImageServer) are slow per request
+                n = src.chunk_count(bbox, res)
+                row["requests"] = n
+                row["fetch_minutes"] = round(n / EXPORT_CHUNKS_PER_MIN)
+            rows.append(row)
         w, h = bbox.size_m()
         return {"area_km": [round(w / 1000, 1), round(h / 1000, 1)], "layers": rows,
                 "total_mb": round(sum(r["est_mb"] for r in rows), 1)}

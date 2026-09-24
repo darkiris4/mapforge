@@ -7,15 +7,14 @@ from __future__ import annotations
 
 import hashlib
 import math
-import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from xml.sax.saxutils import escape
 
 import httpx
 
 from ..geo import BBox, meters_to_deg, web_mercator_res, web_mercator_zoom_for
-from .base import Auth, Context, Item, Source
+from .base import Auth, Cancelled, Context, Item, Source
 
 MERC = 20037508.342789244
 
@@ -68,9 +67,9 @@ class CopernicusDEM(Source):
             local = cache / url.rsplit("/", 1)[1]
             touched = bbox.intersection(fp)
             frac = ((touched.east - touched.west) * (touched.north - touched.south)) if touched else 0.0
+            ctx.progress(f"{self.name}: tile {i}/{len(present)}", (i - 1) / max(len(present), 1))
             if local.exists() or frac >= self.DOWNLOAD_FRACTION:
                 # Mostly-covered tiles are fetched once and cached for later jobs.
-                ctx.progress(f"{self.name}: tile {i}/{len(present)}", None)
                 path = str(ctx.download(url, local, label=f"DEM tile {i}/{len(present)}"))
             else:
                 # Small overlap: read just the needed window of the COG over HTTP.
@@ -85,6 +84,9 @@ class CopernicusDEM(Source):
 # --------------------------------------------------------------------------------------
 class ArcGISImageServer(Source):
     access = "public"
+    WORKERS = 4
+    MIN_SPLIT = 500  # px: smallest export edge worth splitting down to
+    RETRY_DELAYS_S = (5, 15, 45)  # back-off between attempts at the same export
     CHUNK = 2000  # px per request edge; servers cap at ~4000 and time out on big exports
 
     def __init__(self, id, name, url, group, kind="rgb", band_ids="0,1,2", extent=None, description="",
@@ -116,43 +118,79 @@ class ArcGISImageServer(Source):
         cache.mkdir(parents=True, exist_ok=True)
         pixel_type = "F32" if self.kind == "elevation" else "U8"
 
-        def fetch(job):
-            cb, w, h = job
+        def request(cb: BBox, w: int, h: int, dest: Path) -> bool:
+            """One exportImage call with retries. False = the server kept timing out / 5xx."""
+            params = {"bbox": ",".join(f"{v:.9f}" for v in cb.as_tuple()), "bboxSR": 4326, "imageSR": 4326,
+                      "size": f"{w},{h}", "format": "tiff", "pixelType": pixel_type, "f": "image",
+                      "interpolation": "RSP_BilinearInterpolation"}
+            if self.band_ids:
+                params["bandIds"] = self.band_ids
+            with ctx.http(self.auth, timeout=180) as c:
+                for attempt, delay in enumerate(self.RETRY_DELAYS_S):
+                    ctx.check()
+                    try:
+                        r = c.get(f"{self.url}/exportImage", params=params)
+                    except httpx.TransportError:  # includes read timeouts
+                        r = None
+                    if r is not None and r.status_code < 500:
+                        r.raise_for_status()
+                        if "tif" not in r.headers.get("content-type", "") and r.content[:4] not in (b"II*\x00", b"MM\x00*"):
+                            raise RuntimeError(f"{self.name}: server returned {r.headers.get('content-type')}: {r.text[:200]}")
+                        tmp = dest.with_suffix(".part")
+                        tmp.write_bytes(r.content)
+                        tmp.replace(dest)
+                        return True
+                    if attempt < len(self.RETRY_DELAYS_S) - 1:
+                        ctx.cancel_event.wait(delay)  # back off, but stay cancellable
+            return False
+
+        def fetch(cb: BBox, w: int, h: int) -> list[Item]:
             ctx.check()
             key = hashlib.sha1(f"{self.url}|{cb.as_tuple()}|{w}|{h}|{self.band_ids}".encode()).hexdigest()[:20]
-            dest = cache / f"{key}.tif"
-            if not dest.exists():
-                params = {"bbox": ",".join(f"{v:.9f}" for v in cb.as_tuple()), "bboxSR": 4326, "imageSR": 4326,
-                          "size": f"{w},{h}", "format": "tiff", "pixelType": pixel_type, "f": "image",
-                          "interpolation": "RSP_BilinearInterpolation"}
-                if self.band_ids:
-                    params["bandIds"] = self.band_ids
-                with ctx.http(self.auth, timeout=180) as c:
-                    for attempt in range(4):
-                        ctx.check()
-                        try:
-                            r = c.get(f"{self.url}/exportImage", params=params)
-                            if r.status_code < 500:
-                                break
-                        except httpx.TransportError:
-                            if attempt == 3:
-                                raise
-                        time.sleep(3 * 2**attempt)
-                    r.raise_for_status()
-                    if "tif" not in r.headers.get("content-type", "") and not r.content[:4] in (b"II*\x00", b"MM\x00*"):
-                        raise RuntimeError(f"{self.name}: server returned {r.headers.get('content-type')}: {r.text[:200]}")
-                    tmp = dest.with_suffix(".part")
-                    tmp.write_bytes(r.content)
-                    tmp.replace(dest)
-            return Item(path=str(dest), footprint=cb, native_res_m=res_m, gdal_env=self.auth.gdal_env(),
-                        label=f"{self.id} export {cb.west:.4f},{cb.south:.4f}")
+            dest, split_marker = cache / f"{key}.tif", cache / f"{key}.split"
+            if dest.exists() or (not split_marker.exists() and request(cb, w, h, dest)):
+                return [Item(path=str(dest), footprint=cb, native_res_m=res_m, gdal_env=self.auth.gdal_env(),
+                             label=f"{self.id} export {cb.west:.4f},{cb.south:.4f}")]
+            # Big exports time out (504) when the server is busy; quarter the request and retry.
+            if min(w, h) < 2 * self.MIN_SPLIT:
+                raise RuntimeError(f"{self.name}: server kept failing (5xx/timeout) for a {w}x{h} px export "
+                                   f"at {cb.west:.5f},{cb.south:.5f}")
+            split_marker.touch()  # a re-run goes straight to the cached quarters
+            mx, my = (cb.west + cb.east) / 2, (cb.south + cb.north) / 2
+            w1, h1 = w // 2, h // 2
+            quads = [(BBox(cb.west, my, mx, cb.north), w1, h - h1), (BBox(mx, my, cb.east, cb.north), w - w1, h - h1),
+                     (BBox(cb.west, cb.south, mx, my), w1, h1), (BBox(mx, cb.south, cb.east, my), w - w1, h1)]
+            ctx.progress(f"{self.name}: server timed out on a {w}x{h} export — retrying as 4 smaller ones", None)
+            return [item for q in quads for item in fetch(*q)]
 
-        out: list[Item] = []
-        with ThreadPoolExecutor(4) as pool:
-            for i, item in enumerate(pool.map(fetch, jobs), 1):
-                ctx.progress(f"{self.name}: fetched {i}/{len(jobs)} chunks", None)
-                out.append(item)
-        return out
+        # Report in completion order: pool.map would stall the count behind one slow chunk.
+        out: list[list[Item] | None] = [None] * len(jobs)
+        ctx.progress(f"{self.name}: requesting {len(jobs)} export chunk(s) from the server", 0.0)
+        with ThreadPoolExecutor(self.WORKERS) as pool:
+            futures = {pool.submit(fetch, *job): n for n, job in enumerate(jobs)}
+            try:
+                for done, fut in enumerate(as_completed(futures), 1):
+                    out[futures[fut]] = fut.result()
+                    ctx.progress(f"{self.name}: fetched {done}/{len(jobs)} chunks", done / len(jobs))
+            except Exception as e:
+                if isinstance(e, Cancelled):
+                    raise
+                for f in futures:
+                    f.cancel()
+                cached = sum(1 for o in out if o is not None)
+                raise RuntimeError(f"{e} — {cached}/{len(jobs)} chunks are cached; run the job again "
+                                   f"to resume from them") from e
+        return [i for chunk in out if chunk for i in chunk]
+
+    def chunk_count(self, bbox: BBox, res_m: float) -> int:
+        """Number of exportImage requests items() will make (for the size estimate)."""
+        if self.extent:
+            bbox = bbox.intersection(BBox(*self.extent))
+            if not bbox:
+                return 0
+        xd, yd = meters_to_deg(res_m, bbox.center_lat)
+        return (math.ceil((bbox.east - bbox.west) / (self.CHUNK * xd) - 1e-9)
+                * math.ceil((bbox.north - bbox.south) / (self.CHUNK * yd) - 1e-9))
 
 
 # --------------------------------------------------------------------------------------

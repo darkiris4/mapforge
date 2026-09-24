@@ -334,6 +334,14 @@ function persist() {
 let estT;
 function scheduleEstimate() { clearTimeout(estT); estT = setTimeout(estimate, 300); }
 ["#oTif", "#oCog", "#oMbt", "#oDted", "#jobName"].forEach((id) => $(id).addEventListener("change", () => { persist(); scheduleEstimate(); }));
+// ArcGIS ImageServer exports (e.g. NAIP) are one slow server request per 2000 px chunk.
+function exportNote(l) {
+  if (!l.requests) return "";
+  const t = l.fetch_minutes >= 90 ? `${(l.fetch_minutes / 60).toFixed(1)} h` : `${Math.max(1, l.fetch_minutes)} min`;
+  const cls = l.fetch_minutes >= 30 ? "bad" : "muted";
+  return `<br><span class="${cls}">↳ ${l.requests.toLocaleString()} server export request(s), roughly ${t} to download` +
+    (l.fetch_minutes >= 30 ? " — consider a coarser resolution, a smaller box, or USGS Imagery tiles" : "") + "</span>";
+}
 async function estimate() {
   const ok = bbox && selected.size;
   $("#buildBtn").disabled = !ok;
@@ -342,7 +350,7 @@ async function estimate() {
     const e = await api("/api/estimate", { method: "POST", json: spec() });
     const noData = e.layers.filter((l) => $(`.src[data-id="${CSS.escape(l.source)}"]`)?.classList.contains("nocov"));
     $("#estimate").innerHTML = e.layers.map((l) =>
-      `${esc(l.name)}: ${l.width.toLocaleString()}×${l.height.toLocaleString()} px @ ${l.res_m} m ≈ ${l.est_mb} MB${l.too_big ? ' <b class="bad">too large — use a coarser resolution</b>' : ""}`).join("<br>")
+      `${esc(l.name)}: ${l.width.toLocaleString()}×${l.height.toLocaleString()} px @ ${l.res_m} m ≈ ${l.est_mb} MB${l.too_big ? ' <b class="bad">too large — use a coarser resolution</b>' : ""}${exportNote(l)}`).join("<br>")
       + `<br><b>≈ ${e.total_mb.toLocaleString()} MB total</b> (GeoTIFF estimate)`
       + (noData.length ? `<div class="hint">${noData.map((l) => esc(l.name)).join(", ")}: no known data in this area.</div>` : "")
       + (e.total_mb > 4000 ? `<div class="hint">This is a big package; building may take a long time.</div>` : "");
