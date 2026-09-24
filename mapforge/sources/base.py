@@ -122,6 +122,8 @@ class Item:
     # Optional lon/lat polygons ([(lon, lat), ...]); only pixels inside all of them are used.
     # Charts use this to drop collars/legends outside the neatline.
     clip: list[list[tuple[float, float]]] | None = None
+    # True for rasters built from a map service (tiles/WMS), which publishes no files to copy.
+    service: bool = False
 
 
 @dataclass

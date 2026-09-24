@@ -575,6 +575,8 @@ def _safe_stem(s: str) -> str:
 
 
 def _item_stem(item: Item) -> str:
+    if item.service:  # built from a map service: name it after the layer, not the internal file
+        return _safe_stem(item.label or Path(item.path).stem)
     m = _TOC_ENTRY.match(item.path)
     if m:
         return _safe_stem(m.group(2).replace(":", "-"))
@@ -636,7 +638,7 @@ def describe_file(path: Path, rel: str, source_label: str = "") -> dict:
 
 def _is_service(item: Item) -> bool:
     """True for tile/WMS/WMTS services, which publish no files to copy."""
-    if item.path.startswith("WMTS:"):
+    if item.service or item.path.startswith("WMTS:"):
         return True
     if item.path.lower().endswith(".xml") and "_TOC_ENTRY:" not in item.path:
         try:

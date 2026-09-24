@@ -14,9 +14,10 @@ from rasterio.io import MemoryFile
 
 from mapforge import process
 from mapforge.geo import BBox
-from mapforge.process import LayerOptions, OutputOptions, ServerDroppedError, build_layer
+from mapforge.process import LayerOptions, OutputOptions, build_layer
 from mapforge.settings import Settings
 from mapforge.sources.base import Context
+from mapforge.sources import xyz
 from mapforge.sources.services import TileService
 
 TILE_RE = re.compile(r"^/tiles/(\d+)/(\d+)/(\d+)\.png$")
@@ -68,6 +69,7 @@ def flaky(monkeypatch):
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FlakyTiles)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     monkeypatch.setattr(process, "NET_RETRY_DELAYS_S", (0, 0, 0))
+    monkeypatch.setattr(xyz, "RETRY_DELAYS_S", (0, 0, 0))
     yield f"http://127.0.0.1:{srv.server_address[1]}/tiles/{{z}}/{{x}}/{{y}}.png"
     srv.shutdown()
 
@@ -104,7 +106,7 @@ def test_first_request_for_every_tile_drops_but_layer_completes(settings, tmp_pa
 def test_server_that_keeps_dropping_gives_a_plain_error(settings, tmp_path, flaky):
     # The probe succeeds (first few requests), then the server drops everything.
     FlakyTiles.policy = staticmethod(lambda path, n, total: total > 3)
-    with pytest.raises(ServerDroppedError, match=r"kept dropping the connection.*run the job again"):
+    with pytest.raises(RuntimeError, match=r"could not be downloaded after \d+ tries.*run the job again"):
         build_layer(tile_source(flaky), BOX, LayerOptions(res_m=20), OutputOptions(overviews=False),
                     tmp_path / "out", Context(settings), "flaky", mode="clipped")
 

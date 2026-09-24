@@ -11,6 +11,7 @@ import math
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -18,6 +19,7 @@ import httpx
 
 from .. import speeds
 from ..geo import BBox, meters_to_deg, web_mercator_res, web_mercator_zoom_for
+from . import xyz
 from .base import (Auth, Cancelled, Context, Item, Source, _level, cached_note, estimate_result,
                    generic_detail_levels, plain_duration, speed_note)
 
@@ -352,8 +354,10 @@ class ArcGISImageServer(Source):
 class TileService(Source):
     """XYZ ("{z}/{x}/{y}"), ArcGIS MapServer tiles, WMTS capabilities URLs or WMS GetMap.
 
-    Tiles are fetched lazily by GDAL for only the area being processed, at the zoom level /
-    overview that matches the requested resolution, and cached on disk for reuse.
+    XYZ imagery (incl. ArcGIS tile endpoints) is downloaded by MapForge itself over a pooled
+    connection and stitched locally (see sources/xyz.py) — much faster than GDAL, which opens a
+    new connection per tile. WMS/WMTS and elevation tiles are still read through GDAL, lazily,
+    at the zoom level / overview that matches the requested resolution, and cached on disk.
     """
 
     def __init__(self, id, name, url, group, service="xyz", layer="", max_zoom=19, image_format="image/jpeg",
@@ -392,6 +396,18 @@ class TileService(Source):
             size = n * tile_bytes
             rate, basis = speeds.get(settings, host)
             what = f"{n:,} map tile{'s' if n != 1 else ''} (zoom level {z})"
+            if self._fast_xyz() and n <= 50_000:  # tiles are plain files: count what's cached
+                cache = self._tile_cache(settings)
+                rng = xyz.tile_range(bbox, z)
+                have = sum(xyz.is_cached(cache, z, x, y)
+                           for y in range(rng[1], rng[3] + 1) for x in range(rng[0], rng[2] + 1))
+                todo = n - have
+                seconds = todo / rate
+                notes = [f"{what}; {todo:,} still to fetch — {plain_duration(seconds)}."
+                         if have else f"{what} to fetch — {plain_duration(seconds)}."]
+                notes += speed_note(basis)
+                return estimate_result(todo * tile_bytes, 100.0 * have / n if n else 0, n, seconds, notes, basis,
+                                       source_bytes=size * 1.1, clipped_bytes=size * 1.1)
         seconds = n / rate
         notes = [f"{what} to fetch — {plain_duration(seconds)}.",
                  "Pieces fetched before are reused from the local cache, so repeat jobs are faster."]
@@ -403,6 +419,17 @@ class TileService(Source):
         p = ctx.settings.cache_dir / "tiles" / self.id
         p.mkdir(parents=True, exist_ok=True)
         return p
+
+    def _fast_xyz(self) -> bool:
+        """XYZ imagery is downloaded by MapForge itself (see sources/xyz.py); others use GDAL."""
+        return self.service == "xyz" and self.kind == "rgb"
+
+    def _tile_cache(self, settings) -> Path:
+        # Keyed by URL so a corrected custom-endpoint URL doesn't inherit "no tile here" markers.
+        return settings.cache_dir / "tiles" / self.id / hashlib.sha1(self.url.encode()).hexdigest()[:10]
+
+    def _zoom(self, bbox: BBox, res_m: float) -> int:
+        return min(self.max_zoom, web_mercator_zoom_for(max(res_m, 0.05), bbox.center_lat))
 
     def _xyz_xml(self, ctx: Context) -> str:
         url = self.url.replace("{z}", "${z}").replace("{x}", "${x}").replace("{y}", "${y}")
@@ -445,6 +472,20 @@ class TileService(Source):
             # No probe: opening a WMTS dataset already fetches GetCapabilities, so a bad URL or
             # credential fails immediately when the layer is opened for rendering.
             return [Item(path=path, footprint=bbox, label=self.name, gdal_env=env)]
+        if self._fast_xyz():
+            self._probe_xyz(bbox, res_m, ctx)
+            z = self._zoom(bbox, res_m)
+            rng = xyz.tile_range(bbox, z)
+            n = (rng[2] - rng[0] + 1) * (rng[3] - rng[1] + 1)
+            if n > xyz.MAX_TILES:
+                raise ValueError(f"{self.name}: {n:,} map tiles at this level of detail is too many for one job — "
+                                 "choose less detail or a smaller area")
+            cache = self._tile_cache(ctx.settings)
+            fetch_ctx = replace(ctx, progress=lambda m, f=None: ctx.progress(m, None if f is None else 0.9 * f))
+            xyz.fetch_tiles(self.url, z, rng, cache, fetch_ctx, self.auth, self.name, self.id)
+            build_ctx = replace(ctx, progress=lambda m, f=None: ctx.progress(m, None if f is None else 0.9 + 0.1 * f))
+            mosaic = xyz.build_mosaic(cache, z, rng, build_ctx, self.name)
+            return [Item(path=str(mosaic), footprint=bbox, label=self.name, service=True)]
         if self.service == "wms":
             xml = self._wms_xml(bbox, res_m, ctx)
         else:
