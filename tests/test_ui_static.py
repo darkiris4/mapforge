@@ -37,6 +37,10 @@ def test_ui_never_injects_unescaped_api_text():
     # Every ${…} interpolated into HTML templates in the UI scripts that carries API/user data
     # must go through esc() (or be a number/format helper). Spot-check the risky fields.
     risky = re.compile(r"\$\{(?:j|l|d|s|e|p|r)\.(?:name|message|label|path|detail|plain_name|explain|description|license|url)\}")
+    # Text-only sinks never parse HTML, so interpolating raw text into them is safe.
+    text_sinks = ("toast(", "confirm(", ".textContent", "alert(", "prompt(")
     for f in ["build.js", "jobs.js", "admin.js", "map.js"]:
-        text = (STATIC / f).read_text()
-        assert not risky.search(text), f"{f}: {risky.search(text).group(0)} is not escaped"
+        for n, line in enumerate((STATIC / f).read_text().splitlines(), 1):
+            m = risky.search(line)
+            if m and not any(sink in line for sink in text_sinks):
+                raise AssertionError(f"{f}:{n}: {m.group(0)} is not escaped")
