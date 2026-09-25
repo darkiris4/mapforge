@@ -31,6 +31,18 @@ LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "[::1]", "::1"}
 SAFE_NAME = re.compile(r"[^A-Za-z0-9._ -]+")
 
 
+class _RevalidatingStaticFiles(StaticFiles):
+    """Static files aren't content-hashed, so without an explicit Cache-Control header browsers
+    apply their own heuristic freshness and can skip asking the server at all — a browser open
+    across a MapForge upgrade can keep running old UI JS/CSS indefinitely, silently. "no-cache"
+    forces a revalidation request (cheap 304 via ETag when unchanged) on every load instead."""
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 def _hostname(host_header: str) -> str:
     h = host_header.strip().lower()
     if h.startswith("["):
@@ -363,7 +375,7 @@ def create_app(settings: Settings | None = None, allowed_hosts: set[str] | None 
         return {"data_dir": str(s.data_dir), "library_dirs": [str(d) for d in s.library_dirs],
                 "max_pixels": s.max_pixels, "token_required": bool(s.token)}
 
-    app.mount("/", StaticFiles(directory=STATIC, html=True), name="static")
+    app.mount("/", _RevalidatingStaticFiles(directory=STATIC, html=True), name="static")
     return app
 
 

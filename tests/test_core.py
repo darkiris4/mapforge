@@ -120,6 +120,38 @@ def test_chart_mosaic_drops_collars(settings, tmp_path):
     assert (rgb[0, :, 0] == 255).all() and (rgb[2, :, -1] == 255).all()  # red west, blue east
 
 
+def test_kongsberg_mode_clips_to_drawn_polygon(settings, tmp_path):
+    """build_layer(clip_polygon=...) must mask pixels outside the shape, on top of the plain
+    bbox fetch — the whole feature is Item.clip getting the user's polygon appended to it."""
+    rgb = tmp_path / "rgb.tif"
+    size = 200
+    with rasterio.open(rgb, "w", driver="GTiff", width=size, height=size, count=3, dtype="uint8",
+                       crs="EPSG:4326", transform=from_bounds(0, 0, 2, 2, size, size)) as ds:
+        ds.write(np.full((3, size, size), 200, np.uint8))
+    bbox = BBox(0, 0, 2, 2)
+    src = FileSource([rgb])
+
+    # Unclipped: the whole bbox fills.
+    plain = build_layer(src, bbox, LayerOptions(res_m=20000), OutputOptions(), tmp_path / "plain",
+                        Context(settings), "area")
+    assert plain["coverage_pct"] == 100.0
+
+    # Triangle covering roughly the lower-left half of the bbox (closed ring, as jobs.py's
+    # validate() would hand to build_layer after parsing the frontend's open-ring polygon).
+    triangle = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (0.0, 0.0)]
+    clipped = build_layer(src, bbox, LayerOptions(res_m=20000), OutputOptions(), tmp_path / "clipped",
+                          Context(settings), "area", clip_polygon=triangle)
+    assert clipped["status"] == "ok"
+    assert 0 < clipped["coverage_pct"] < 100.0, "a triangle covers less than the full bbox"
+    with rasterio.open(tmp_path / "clipped" / "area.tif") as ds:
+        rgb_out = ds.read()
+        mask = ds.dataset_mask()
+    # Near the bottom-left corner (deep inside the triangle) pixels are kept…
+    assert rgb_out[:, -1, 0].max() == 200 and mask[-1, 0] != 0
+    # …near the top-right corner (outside the triangle, inside the plain bbox) they are not.
+    assert mask[0, -1] == 0
+
+
 def test_elevation_geotiff_and_dted(settings, tmp_path):
     dem = tmp_path / "dem.tif"
     # DTED posts sit half a spacing outside the 1-degree cell edges, so cover a margin too.

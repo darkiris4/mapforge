@@ -6,6 +6,12 @@ from one host), ``chunks:usgs-naip`` (ImageServer exports/s) or ``tiles:tiles.ma
 (tiles/s). Values persist in ``data/config/speeds.json`` so estimates improve with use.
 Until a key has a measurement, estimates use conservative defaults and say so
 (``speed_basis: "default"``).
+
+MapForge is mostly run on a laptop, not a dedicated server with a stable pipe — the network
+(home/office/hotspot/VPN) can easily be different from the last run. So a sample only counts as
+``"measured"`` if it was recorded *during this process's run*; a sample from an earlier run is
+still used as a better-than-nothing starting guess (rather than falling back to the generic
+DEFAULTS below), but is honestly reported as ``"default"`` until this run has tested it for real.
 """
 from __future__ import annotations
 
@@ -28,6 +34,7 @@ DEFAULTS = {
 
 _lock = threading.Lock()
 _cache: dict[str, dict] = {}  # config-file path -> {key: {"value", "n", "updated"}}
+_started_at = time.time()  # samples from before this run don't count as "measured" this session
 
 
 def _path(settings) -> Path:
@@ -78,11 +85,14 @@ def record(settings, key: str, amount: float, seconds: float) -> None:
 
 
 def get(settings, key: str, default: float | None = None) -> tuple[float, str]:
-    """(value, basis) where basis is "measured" or "default"."""
+    """(value, basis) where basis is "measured" (tested this run) or "default" (a guess —
+    possibly seeded from a stale sample from a previous run, but not yet confirmed this run)."""
     with _lock:
         cur = _load(settings).get(key)
     if cur and cur.get("n", 0) >= 1:
-        return float(cur["value"]), "measured"
+        if cur.get("updated", 0) >= _started_at:
+            return float(cur["value"]), "measured"
+        return float(cur["value"]), "default"  # stale: a decent guess, but not tested this run
     kind = key.split(":", 1)[0]
     return float(default if default is not None else DEFAULTS.get(kind, 1.0)), "default"
 

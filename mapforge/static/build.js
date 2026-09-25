@@ -15,7 +15,7 @@ const CONUS = [-125, 24, -66.5, 49.5];
 // What gets ticked when a whole category is chosen in guided mode.
 function recommendedFor(cat) {
   const inConus = st.bbox && st.bbox[0] >= CONUS[0] && st.bbox[2] <= CONUS[2] && st.bbox[1] >= CONUS[1] && st.bbox[3] <= CONUS[3];
-  const pick = { vfr: ["faa-sectional"], ifr: ["faa-ifr-low"], imagery: [inConus ? "usgs-naip" : "s2cloudless-2024"], elevation: ["copernicus-dem-30"] }[cat] || [];
+  const pick = { vfr: ["faa-sectional"], ifr: ["faa-ifr-low"], imagery: [inConus ? "usgs-naip" : "esri-world-imagery"], elevation: ["copernicus-dem-30"] }[cat] || [];
   const ok = pick.filter((id) => srcById(id));
   if (ok.length) return ok;
   const first = sources.find((s) => categoryOf(s) === cat);
@@ -89,10 +89,14 @@ async function loadSources() {
 
 // ------------------------------------------------------------------------------ estimate
 let est = null, estErr = null, estSeq = 0, estT, estLoading = false;
+let estProbeT = null, estProbeAttempts = 0;  // see the re-poll below
 const layerCount = () => Object.keys(st.layers).length;
-function scheduleEstimate() { clearTimeout(estT); estLoading = !!(st.bbox && layerCount()); paintEstimates(); estT = setTimeout(runEstimate, 350); }
+function scheduleEstimate() {
+  clearTimeout(estT); clearTimeout(estProbeT); estProbeAttempts = 0;
+  estLoading = !!(st.bbox && layerCount()); paintEstimates(); estT = setTimeout(runEstimate, 350);
+}
 async function runEstimate() {
-  if (!st.bbox || !layerCount()) { est = null; estErr = null; estLoading = false; paintEstimates(); return; }
+  if (!st.bbox || !layerCount()) { est = null; estErr = null; estLoading = false; clearTimeout(estProbeT); paintEstimates(); return; }
   const seq = ++estSeq;
   try {
     const e = await api("/api/estimate", { method: "POST", json: jobSpec() });
@@ -104,6 +108,14 @@ async function runEstimate() {
   }
   estLoading = false;
   paintEstimates();
+  // Any "default" (rough) row made the server kick a small background speed test (see
+  // JobManager._probe_in_background) — one short re-poll picks up a real measurement
+  // without the user touching anything. Capped so an unreachable host doesn't poll forever.
+  clearTimeout(estProbeT);
+  if (est?.layers?.some((l) => l.speed_basis === "default") && estProbeAttempts < 4) {
+    estProbeAttempts++;
+    estProbeT = setTimeout(() => { if (seq === estSeq) runEstimate(); }, 3000);
+  }
 }
 const rowFor = (id) => est?.layers?.find((l) => l.source === id) || null;
 // Notes that repeat on every row (e.g. "time is a rough guess…") are shown once, under the totals.
@@ -113,18 +125,31 @@ const rowSlow = (r) => (r.download_seconds ?? (r.fetch_minutes != null ? r.fetch
 function downloadText(r) {
   if (r.download_mb != null) {
     if (r.cached_pct >= 99) return `<span class="good">Already downloaded — no wait</span>`;
-    return `Download <b>${fmtMB(r.download_mb)}</b>, ${fmtAbout(r.download_seconds)}`
+    return `Fetch <b>${fmtMB(r.download_mb)}</b> from the source, ${fmtAbout(r.download_seconds)}`
       + (r.cached_pct > 0 ? ` <span class="muted">(${Math.round(r.cached_pct)}% already here)</span>` : "");
   }
-  if (r.fetch_minutes != null) return `Download: ${r.requests.toLocaleString()} server requests, ${fmtAbout(r.fetch_minutes * 60)}`;
+  if (r.fetch_minutes != null) return `Fetch from the source: ${r.requests.toLocaleString()} server requests, ${fmtAbout(r.fetch_minutes * 60)}`;
   return `<span class="muted">Download size not known yet</span>`;
+}
+// The two sizes can differ a lot and that's normal, not a bug: "download" is the raw bytes
+// pulled from the provider (e.g. a full chart sheet at its native scan resolution); "package" is
+// what you actually get after MapForge clips it to your area and converts it at your chosen
+// detail level. Flag it in plain words whenever the gap is big enough to look surprising.
+function sizeGapNote(downloadMb, packageMb) {
+  if (downloadMb == null || packageMb == null || downloadMb <= 0) return "";
+  return packageMb <= downloadMb * 0.6
+    ? `<div class="muted">Package is smaller than the download because it's clipped to your area and converted at your chosen detail level — the download includes the whole source file(s).</div>`
+    : "";
 }
 function layerEstHTML(id) {
   const r = rowFor(id);
   if (!r) return estLoading ? '<span class="muted">Working out size…</span>' : "";
   const pkg = r.package_mb ?? r.est_mb;
-  let h = `<div>${downloadText(r)} · in package <b>${fmtMB(pkg)}</b>`
-    + (r.speed_basis === "default" ? ` <span class="muted" title="Based on typical speeds; MapForge learns this server's real speed after the first download">(rough)</span>` : "") + `</div>`;
+  let h = `<div>${downloadText(r)} · in your package <b>${fmtMB(pkg)}</b>`
+    + (r.speed_basis === "default"
+      ? ` <span class="tag rough" title="This server's real speed hasn't been measured yet this session — time is a guess based on typical speeds, and will firm up automatically in a few seconds or after the first real download">not yet timed</span>`
+      : "") + `</div>`;
+  h += sizeGapNote(r.download_mb, pkg);
   if (r.too_big) h += `<div class="bad">Too much detail for an area this size — choose a lower level or a smaller area.</div>`;
   else if (rowSlow(r)) h += `<div class="hint">Slow: this will take a long time. A lower level of detail or a smaller area is much faster.</div>`;
   for (const n of layerNotes(r)) h += `<div class="muted">${esc(n)}</div>`;
@@ -142,9 +167,10 @@ function totalsHTML() {
   const t = totals();
   if (!t) return "";
   return `<div class="totals">
-    <div><span class="muted">Download</span><b>${t.dl != null ? fmtMB(t.dl) : "?"}</b></div>
+    <div><span class="muted">Fetch from source</span><b>${t.dl != null ? fmtMB(t.dl) : "?"}</b></div>
     <div><span class="muted">Time to download</span><b>${fmtAbout(t.secs)}</b></div>
-    <div><span class="muted">Package size</span><b>${fmtMB(t.pkg)}</b></div></div>`
+    <div><span class="muted">Your package</span><b>${fmtMB(t.pkg)}</b></div></div>`
+    + sizeGapNote(t.dl, t.pkg)
     + [...new Set(est.layers.flatMap((l) => (l.notes || []).filter(isGeneralNote)))].map((n) => `<div class="muted">${esc(n)}</div>`).join("");
 }
 // Why the Build button can't be pressed yet — shown right next to it.
@@ -182,6 +208,9 @@ function paintEstimates() {
   $$(".src-pick[data-src]").forEach((el) => el.classList.toggle("nodata", hasDataHere(el.dataset.src) === false));
 }
 coverageListeners.push(paintEstimates);
+// Re-render the guided nav (Next button / checking banner) as coverage checks resolve — they
+// now fire in parallel (see map.js) so this settles in about one round trip, not one per source.
+coverageListeners.push(() => { if (st.view === "guided" && st.step === 1) renderPanel(); });
 
 // ---------------------------------------------------------------------------------- build
 async function build() {
@@ -189,7 +218,7 @@ async function build() {
   if (b.length) return toast(b[0], 5000);
   const t = totals(), w = warnings();
   if (t && (t.secs >= 1800 || t.pkg >= 4000 || w.length)) {
-    const msg = ["Before you start:", ...w, "", `Download ${t.dl != null ? fmtMB(t.dl) : "size unknown"} (${fmtAbout(t.secs)}), package ${fmtMB(t.pkg)}.`, "", "Start the job?"].join("\n");
+    const msg = ["Before you start:", ...w, "", `Fetch ${t.dl != null ? fmtMB(t.dl) : "size unknown"} from the source (${fmtAbout(t.secs)}), your package ${fmtMB(t.pkg)}.`, "", "Start the job?"].join("\n");
     if (!confirm(msg)) return;
   }
   $$("[data-build]").forEach((el) => (el.disabled = true));
@@ -204,6 +233,7 @@ async function build() {
 // Put a job's settings back into the form (Jobs tab "Run again / Edit & re-run").
 function loadSpec(spec) {
   st.bbox = null;
+  st.polygon = spec.polygon || null;
   st.layers = Object.fromEntries((spec.layers || []).map((l) => [l.source, { res_m: l.res_m ?? "" }]));
   st.mode = spec.mode || "kongsberg";
   if (spec.outputs) st.outputs = { ...st.outputs, ...spec.outputs, dted_level: spec.outputs.dted_level ?? "" };
@@ -357,10 +387,12 @@ function toggleLayer(id, on) {
 function areaHTML(guided = false) {
   return `<div class="area">
     <div class="row">
-      <button type="button" class="${drawing ? "" : "primary"}" data-area="draw">${drawing ? "✕ Stop drawing" : "▭ Draw on the map"}</button>
+      <button type="button" class="${drawing ? "" : "primary"}" data-area="draw">${drawing ? "✕ Stop drawing" : "▭ Draw a box"}</button>
+      <button type="button" class="${drawingPoly ? "" : "primary"}" data-area="drawpoly">${drawingPoly ? "✕ Stop drawing" : "⬠ Draw a polygon"}</button>
       <button type="button" data-area="view">Use what's on screen</button>
-      ${st.bbox ? `<button type="button" class="danger" data-area="clear" title="Remove the box (Delete key)">Clear box</button>` : ""}
+      ${st.bbox ? `<button type="button" class="danger" data-area="clear" title="Remove the area (Delete key)">Clear area</button>` : ""}
     </div>
+    ${st.polygon && st.mode !== "kongsberg" ? `<p class="hint">The "${esc(MODES[st.mode]?.title || st.mode)}" output mode uses your shape's bounding box, not its exact outline — switch to Kongsberg-ready for the precise shape.</p>` : ""}
     <details ${guided ? "open" : ""} class="pt"><summary>Around a point (lat/lon + radius)</summary>
       <div class="grid3">
         <label>Latitude<input id="cLat" type="number" step="any" placeholder="38.85" data-pt="lat" value="${esc(st.point.lat)}"></label>
@@ -383,9 +415,16 @@ function areaHTML(guided = false) {
   </div>`;
 }
 function wireArea() {
-  panel.querySelector("[data-area=draw]")?.addEventListener("click", () => { setDrawing(!drawing); });
+  panel.querySelector("[data-area=draw]")?.addEventListener("click", () => {
+    if (drawingPoly) setDrawingPoly(false);
+    setDrawing(!drawing);
+  });
+  panel.querySelector("[data-area=drawpoly]")?.addEventListener("click", () => {
+    if (drawing) setDrawing(false);
+    setDrawingPoly(!drawingPoly);
+  });
   panel.querySelector("[data-area=view]")?.addEventListener("click", () => {
-    if (st.bbox && !confirm("Replace the current box with what's on screen?")) return;
+    if (st.bbox && !confirm("Replace the current area with what's on screen?")) return;
     bboxFromView();
   });
   panel.querySelector("[data-area=clear]")?.addEventListener("click", clearBBox);
@@ -396,11 +435,12 @@ function wireArea() {
   const corners = panel.querySelectorAll("[data-corner]");
   corners.forEach((c) => c.addEventListener("change", () => {
     const v = [...corners].map((x) => x.value);
-    if (v.every((x) => x !== "")) setBBox(v, { fit: true }); else c.classList.add("pending");
+    if (v.every((x) => x !== "")) { clearPolygonShape(); setBBox(v, { fit: true }); } else c.classList.add("pending");
   }));
   panel.querySelector("[data-paste]")?.addEventListener("change", (e) => {
     const v = e.target.value.split(/[\s,;]+/).filter(Boolean).map(Number);
-    if (v.length === 4 && v.every(Number.isFinite)) setBBox(v, { fit: true }); else toast("Paste four numbers: west, south, east, north.");
+    if (v.length === 4 && v.every(Number.isFinite)) { clearPolygonShape(); setBBox(v, { fit: true }); }
+    else toast("Paste four numbers: west, south, east, north.");
   });
 }
 drawListeners.push(() => renderPanel());
@@ -446,12 +486,18 @@ function stepReady(i) {
   if (i === 1) return layerCount() > 0;
   return true;
 }
+// Sources whose availability in the drawn area is still being checked (charts / local library —
+// continuous sources like imagery/elevation have no per-sheet coverage to check).
+const checkableSourceIds = () => sources.filter((s) => s.coverage).map((s) => s.id);
+function whatCheckPending() { return !!st.bbox && anyCoveragePending(checkableSourceIds()); }
 function renderGuided() {
   st.step = Math.max(0, Math.min(st.step || 0, STEPS.length - 1));
   // Can't be past a step whose prerequisite is missing (e.g. area cleared while on Review).
   for (let i = 0; i < st.step; i++) if (!stepReady(i)) { st.step = i; break; }
   const i = st.step;
   const body = [guidedWhere, guidedWhat, guidedDetail, guidedProduce, guidedDeliver, guidedReview][i]();
+  const pending = i === 1 && whatCheckPending();
+  const nextReady = stepReady(i) && !pending;
   panel.innerHTML = `
     <ol class="stepper" aria-label="Steps">${STEPS.map((s, k) => `<li class="${k === i ? "on" : k < i ? "done" : ""}">
       <button type="button" data-goto="${k}" ${k > i && !Array.from({ length: k }, (_, j) => stepReady(j)).every(Boolean) ? "disabled" : ""}
@@ -459,11 +505,11 @@ function renderGuided() {
     <div class="gstep">${body}</div>
     <div class="gnav">
       ${i > 0 ? `<button type="button" data-goto="${i - 1}">← Back</button>` : "<span></span>"}
-      ${i < STEPS.length - 1 ? `<button type="button" class="primary" data-next ${stepReady(i) ? "" : "disabled"}>Next: ${esc(STEPS[i + 1])} →</button>`
+      ${i < STEPS.length - 1 ? `<button type="button" class="primary" data-next ${nextReady ? "" : "disabled"}>${pending ? "Checking availability…" : `Next: ${esc(STEPS[i + 1])} →`}</button>`
         : `<button type="button" class="primary" data-build>Build package</button>`}
     </div>
     ${i < STEPS.length - 1 ? "" : '<div data-why class="why"></div>'}`;
-  panel.querySelector("[data-next]")?.addEventListener("click", () => { if (stepReady(i)) { st.step = i + 1; persist(); renderPanel(); panel.scrollTop = 0; } });
+  panel.querySelector("[data-next]")?.addEventListener("click", () => { if (nextReady) { st.step = i + 1; persist(); renderPanel(); panel.scrollTop = 0; } });
   panel.querySelectorAll("[data-cat]").forEach((c) => c.addEventListener("change", () => {
     const cat = c.dataset.cat;
     if (c.checked) recommendedFor(cat).forEach((id) => (st.layers[id] = st.layers[id] || { res_m: "" }));
@@ -475,12 +521,13 @@ function renderGuided() {
 }
 function guidedWhere() {
   return `<h2>Where do you need maps?</h2>
-    <p class="lead">Mark the area on the map. Draw a box, or give a point and a radius, e.g. from a tasking.</p>
+    <p class="lead">Mark the area on the map. Draw a box or a polygon, or give a point and a radius, e.g. from a tasking.</p>
     ${areaHTML(true)}
     ${drawing ? '<p class="hint">Press and drag on the map to draw. Press Esc to cancel.</p>' : ""}`;
 }
 function guidedWhat() {
   return `<h2>What do you need?</h2><p class="lead">Tick what you need. We pick a sensible source in each; open a group to change it.</p>
+    ${whatCheckPending() ? `<p class="hint">Checking which charts/local products actually cover your area — items with no data here will be greyed out and marked in a moment.</p>` : ""}
     ${CATEGORIES.map((c) => {
       const list = sources.filter((s) => categoryOf(s) === c.id);
       const on = list.some((s) => st.layers[s.id]);

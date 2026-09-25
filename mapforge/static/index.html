@@ -31,7 +31,7 @@
     <div class="mapwrap">
       <div id="map"></div>
       <div class="maptools">
-        <button type="button" id="mapClear" class="hidden danger" title="Remove the box (Delete key)">✕ Clear box</button>
+        <button type="button" id="mapClear" class="hidden danger" title="Remove the shape (Delete key)">✕ Clear area</button>
         <select id="basemap" aria-label="Background map">
           <option value="osm">Street map</option>
           <option value="usgs">Satellite (USGS)</option>
@@ -39,7 +39,8 @@
           <option value="none">No background (grid)</option>
         </select>
       </div>
-      <div id="drawHint" class="drawhint hidden" role="status">Press and drag on the map to draw your area
+      <div id="drawHint" class="drawhint hidden" role="status"><span id="drawHintText">Press and drag on the map to draw your area</span>
+        <button type="button" class="ok hidden" aria-label="Finish shape">✓ Finish (Enter)</button>
         <button type="button" class="x" aria-label="Stop drawing">Cancel (Esc)</button></div>
       <div id="legend" class="legend hidden" aria-label="Coverage legend"></div>
     </div>

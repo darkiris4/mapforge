@@ -149,6 +149,7 @@ const SPLIT_PRESETS = [
 const legacy = store.get("state", {});  // pre-guided-mode saved state
 const st = Object.assign({
   bbox: legacy.bbox || null,
+  polygon: null,  // [[lon,lat], ...] open ring, or null for a plain box
   mode: "kongsberg",
   layers: legacy.selected || {},  // id -> {res_m: number|""}
   outputs: {
@@ -171,6 +172,7 @@ function jobSpec() {
   return {
     name: st.name.trim() || "area",
     bbox: st.bbox,
+    polygon: st.polygon,
     mode: st.mode,
     layers: Object.entries(st.layers).map(([source, o]) => ({ source, res_m: o.res_m === "" || o.res_m == null ? null : +o.res_m })),
     outputs: { ...st.outputs, dted_level: st.outputs.dted_level === "" ? null : st.outputs.dted_level },

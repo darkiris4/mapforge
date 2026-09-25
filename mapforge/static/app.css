@@ -67,6 +67,7 @@ details summary { cursor: pointer; color: var(--muted); font-size: 12px; margin:
 .tag { font-size: 10.5px; padding: 1px 6px; border-radius: 9px; background: var(--chip); color: var(--muted); white-space: nowrap; }
 .tag.pki { background: #7a3e0033; color: var(--warn); }
 .tag.local { background: #2f6f5e22; color: var(--accent); }
+.tag.rough { background: #7a3e0033; color: var(--warn); cursor: help; }
 .page { padding: 16px 20px; overflow-y: auto; width: 100%; max-width: 1200px; }
 .page.two { display: grid; grid-template-columns: 1fr 420px; gap: 20px; max-width: 1300px; align-items: start; }
 .job { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin-bottom: 10px; }
@@ -144,6 +145,7 @@ button.danger:hover { border-color: var(--bad); }
 .drawhint { position: absolute; top: 10px; left: 50%; transform: translateX(-50%); z-index: 600; background: var(--ink); color: var(--bg);
   padding: 8px 12px; border-radius: 8px; font-size: 13px; display: flex; gap: 10px; align-items: center; box-shadow: 0 2px 8px rgba(0,0,0,.3); }
 .drawhint .x { background: none; color: inherit; border-color: color-mix(in srgb, var(--bg) 40%, transparent); padding: 2px 8px; font-size: 12px; }
+.drawhint .ok { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); padding: 2px 8px; font-size: 12px; }
 /* glossary */
 button.q { width: 18px; height: 18px; padding: 0; border-radius: 50%; font-size: 11px; line-height: 16px; font-weight: 700;
   color: var(--accent); border: 1px solid var(--accent); background: none; vertical-align: 1px; margin-left: 2px; }
