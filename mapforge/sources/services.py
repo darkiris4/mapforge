@@ -20,7 +20,7 @@ import httpx
 from .. import speeds
 from ..geo import BBox, meters_to_deg, web_mercator_res, web_mercator_zoom_for
 from . import xyz
-from .base import (Auth, Cancelled, Context, Item, Source, _level, cached_note, estimate_result,
+from .base import (Auth, Cancelled, Context, Item, Source, TooManyTiles, _level, cached_note, estimate_result,
                    generic_detail_levels, plain_duration, speed_note)
 
 MERC = 20037508.342789244
@@ -190,6 +190,14 @@ class ArcGISImageServer(Source):
 
     def detail_levels(self) -> list[dict]:
         return self.levels or generic_detail_levels(self.kind, self.default_res_m, self.min_res_m)
+
+    def has_coverage(self) -> bool:
+        # A source limited to a known rectangle (e.g. NAIP's lower-48 extent) has real coverage
+        # to show; one with no extent covers wherever the server answers, which isn't worth a box.
+        return self.extent is not None
+
+    def coverage(self, ctx: Context) -> list[dict]:
+        return [{"label": self.name, "bbox": list(self.extent)}] if self.extent else []
 
     def _plan(self, bbox: BBox, res_m: float) -> list[tuple[BBox, int, int]]:
         """The exportImage requests (bbox, width px, height px) needed to cover bbox at res_m."""
@@ -478,8 +486,8 @@ class TileService(Source):
             rng = xyz.tile_range(bbox, z)
             n = (rng[2] - rng[0] + 1) * (rng[3] - rng[1] + 1)
             if n > xyz.MAX_TILES:
-                raise ValueError(f"{self.name}: {n:,} map tiles at this level of detail is too many for one job — "
-                                 "choose less detail or a smaller area")
+                raise TooManyTiles(f"{self.name}: {n:,} map tiles at this level of detail is too many for one "
+                                   "job — splitting the area into smaller pieces", n / xyz.MAX_TILES)
             cache = self._tile_cache(ctx.settings)
             fetch_ctx = replace(ctx, progress=lambda m, f=None: ctx.progress(m, None if f is None else 0.9 * f))
             xyz.fetch_tiles(self.url, z, rng, cache, fetch_ctx, self.auth, self.name, self.id)
@@ -498,6 +506,17 @@ class TileService(Source):
         if self.service == "wms":
             self._probe_gdal(item, read=True)
         return [item]
+
+    def probe_speed(self, bbox: BBox, res_m: float, ctx: Context) -> None:
+        """Best-effort real tile fetch to seed a fresh this-run throughput sample (see
+        mapforge.speeds) before the user has actually downloaded anything from this host.
+        Silent on failure — this is a background nicety, not a correctness check."""
+        if self.service != "xyz":
+            return  # WMS/WMTS go through GDAL, which times its own real fetches during items()
+        try:
+            self._probe_xyz(bbox, res_m, ctx)
+        except Exception:
+            pass
 
     # -- fail-fast probes: a wrong URL, bad credentials or an empty area should produce a clear
     #    error in seconds, not a long render of blank tiles. ---------------------------------
@@ -603,6 +622,25 @@ def public_service_sources() -> list[Source]:
             "imagery", "Photo basemap — US detailed, world coarse (USGS)",
             "Quick-loading photo map from USGS: NAIP-quality over the US, much coarser elsewhere. "
             "Good when speed matters more than the very finest detail."),
+        _meta(TileService(
+            "esri-world-imagery", "Esri World Imagery (global, sub-metre in many areas)",
+            "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+            img, max_zoom=19, default_res_m=2.0,
+            description="Esri's global satellite/aerial mosaic (Maxar, Airbus, USDA and other contributors). "
+                       "Resolution varies a lot by location: sub-metre in many cities, coarser in remote areas — "
+                       "the best free option MapForge ships for outside-the-US imagery.",
+            license="© Esri and its data providers (Maxar, Airbus, USDA FSA, USGS, AeroGRID, IGN and the GIS "
+                   "user community). Free to view/use under Esri's basemap terms, not public domain — check "
+                   "Esri's terms before redistributing or for large-scale/government use.",
+            levels=[_level("overview", "Regional overview", 20, "Towns, main roads and coastlines"),
+                    _level("area", "Area detail", 5, "Streets and large buildings, most places"),
+                    _level("detailed", "Street-level", 2, "Individual buildings, many populated areas"),
+                    _level("max", "Maximum detail", 0.3, "Finest available where Esri has high-res coverage — "
+                          "varies by location; some remote areas stay coarse")]),
+            "imagery", "Satellite/aerial photos — worldwide, sharper in cities (Esri)",
+            "A global photo mosaic that's much sharper than the Sentinel-2 layer in many populated areas "
+            "(sometimes sub-metre), though quality varies a lot by location — some remote areas are still coarse. "
+            "The best choice here for detailed imagery outside the US."),
         *[_meta(TileService(
             f"s2cloudless-{yr}", f"Sentinel-2 cloudless {yr} (10 m, global)",
             # EOX publishes the original 2016 mosaic as "s2cloudless", later years as "s2cloudless-YYYY".

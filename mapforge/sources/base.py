@@ -27,6 +27,18 @@ class Cancelled(Exception):
     pass
 
 
+class TooManyTiles(ValueError):
+    """A single fetch/render would need more source tiles or output pixels than is safe to do
+    in one piece (e.g. an XYZ source needing more tiles than xyz.MAX_TILES, or a Kongsberg mosaic
+    grid bigger than settings.max_pixels). ``factor`` is roughly how many times over the limit
+    the request is; the caller splits the area into that many pieces and retries each on its own,
+    instead of failing the whole job."""
+
+    def __init__(self, message: str, factor: float):
+        super().__init__(message)
+        self.factor = factor
+
+
 _dl_locks: dict[str, threading.Lock] = {}
 _dl_guard = threading.Lock()
 
@@ -282,7 +294,9 @@ def plain_duration(seconds: float) -> str:
 
 def speed_note(basis: str) -> list[str]:
     return [] if basis == "measured" else [
-        "Time is a rough guess until MapForge has measured this server's speed on your network."]
+        "Time is a rough guess — MapForge hasn't measured this server's real speed on your "
+        "current network yet this session. It's testing in the background and will also learn "
+        "from your first real download."]
 
 
 def cached_note(cached_pct: float, download_bytes: float) -> list[str]:

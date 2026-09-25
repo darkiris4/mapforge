@@ -103,6 +103,21 @@ class Grid:
         )
 
 
+def bbox_of_points(points: list[tuple[float, float]]) -> BBox:
+    """The smallest BBox containing every (lon, lat) point — the fetch envelope for a polygon."""
+    lons = [p[0] for p in points]
+    lats = [p[1] for p in points]
+    return BBox(min(lons), min(lats), max(lons), max(lats))
+
+
+def split_bbox(bbox: BBox, cols: int, rows: int) -> list[BBox]:
+    """cols x rows grid of adjacent sub-boxes exactly covering bbox, row-major (south to north,
+    west to east) — used to break a too-big fetch/render into independently-sized pieces."""
+    dw, dh = (bbox.east - bbox.west) / cols, (bbox.north - bbox.south) / rows
+    return [BBox(bbox.west + c * dw, bbox.south + r * dh, bbox.west + (c + 1) * dw, bbox.south + (r + 1) * dh)
+            for r in range(rows) for c in range(cols)]
+
+
 def grid_for(bbox: BBox, res_m: float) -> Grid:
     """Square-ish ground pixels of res_m metres at the bbox centre latitude."""
     xd, yd = meters_to_deg(res_m, bbox.center_lat)

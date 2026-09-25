@@ -27,8 +27,10 @@ Open `http://127.0.0.1:8765`. The Build tab has two views; switch with the toggl
 (your choice is remembered):
 
 - **Guided** (default on first visit) walks through six plain-language steps:
-  1. **Where**: draw a box, give a centre + radius in NM, type or paste W,S,E,N. *Clear box*
-     (or Delete/Esc) removes it.
+  1. **Where**: draw a box or a polygon, give a centre + radius in NM, or type/paste W,S,E,N.
+     *Clear area* (or Delete/Esc) removes it. A polygon is fetched as its bounding box, then
+     clipped to the exact shape in Kongsberg-ready output; the "Cut to my area" and "Original"
+     modes use the bounding box only.
   2. **What**: pick by need (VFR charts, IFR charts, satellite/aerial imagery, terrain
      elevation, your own/NGA files, custom services), not by provider.
   3. **How detailed**: named levels such as *Regional overview*, *Area detail* or *Street-level*,
@@ -92,7 +94,9 @@ WantedBy=multi-user.target
 | | IFR Enroute Low / High, Area, Alaska, Pacific, Oceanic (NARC, WATRS) | GeoTIFF editions only. PORC (North Pacific) is skipped because it crosses the antimeridian. |
 | Imagery | **USGS NAIP**: 0.3–1 m aerial photography, lower 48 | Chunked `exportImage` from the USGS ImageServer, with retries. |
 | | **USGS Imagery Only**: The National Map tiles | Fast for large US areas. Max zoom 16 (~2 m). |
+| | **Esri World Imagery**: global satellite/aerial mosaic | Sub-metre in many populated areas worldwide, coarser elsewhere — the default pick for non-US areas. **Licence:** © Esri and its data providers; free to view/use under Esri's basemap terms, not public domain — check Esri's terms before redistributing or for large-scale/government use. |
 | | **Sentinel-2 cloudless** (EOX), 10 m global, 2016 and 2024 | **Licence:** the 2016 mosaic is CC BY 4.0. **2017 and later mosaics are CC BY-NC-SA 4.0, which means non-commercial use only**; buy a commercial licence from EOX for anything else. |
+| | **Maxar Open Data**: 30–50 cm, active/recent disaster events only | Real STAC catalogue + per-tile COGs on AWS Open Data, no account needed. Only covers areas with an activated event (wildfires, floods, earthquakes, hurricanes) — use "Show where data exists" before relying on it. **Licence:** CC BY-NC 4.0 — non-commercial use only, attribution required (see the source's licence text for the exact wording). |
 | Elevation | **Copernicus DEM GLO-30 / GLO-90** | Global DSM, COGs on AWS Open Data. Tiles are cached locally. Free including commercial use (attribution required). |
 | | **USGS 3DEP**: 1–10 m, US | Bare-earth elevation, lidar-derived where available. |
 | Local library | Anything on disk: CADRG / CIB (`A.TOC`), ECRG (`TOC.xml`), DTED (`.dt0/.dt1/.dt2`), NITF, GeoTIFF, JPEG 2000 | This is where NGA products downloaded with your CAC go. See [docs/nga-and-pki.md](docs/nga-and-pki.md). |
@@ -142,6 +146,28 @@ lists every file's projection, size and format.
 
 Compression is lossless (deflate) for charts and elevation and JPEG q90 for imagery. You can
 override this per layer through the API (`compression`: `jpeg|deflate|lzw|none`).
+
+### Large areas: automatic tiling
+
+A layer that would need too many pixels in one file (Kongsberg-ready mode, `MAPFORGE_MAX_PIXELS`)
+or too many map tiles in one fetch (any mode, imagery tile services like Esri/Sentinel-2) is not
+refused — it's split into a grid of independently-built tiles instead, each its own
+`tile_00/`, `tile_01/`, … subfolder under the layer:
+
+```
+01_esri-world-imagery/
+├── tile_00/esri-world-imagery.tif   layer.json
+├── tile_01/esri-world-imagery.tif   layer.json
+├── tile_02/esri-world-imagery.tif   layer.json
+└── tile_03/esri-world-imagery.tif   layer.json
+```
+
+Tiles build a few at a time (not one at a time), and a single tile's failure doesn't lose the
+rest — the layer still comes back `ok` with however many tiles succeeded, and the README/manifest
+say plainly how many. Downloading (whole package or "download this layer") already includes
+nested tile folders automatically. There's no separate setting for this — it only ever kicks in
+once a layer actually needs it, at whatever size `MAPFORGE_MAX_PIXELS` and the tile service's own
+per-job cap allow.
 
 ## Delivering packages
 
@@ -196,7 +222,7 @@ elevation data sources. In short:
 | `MAPFORGE_HOST` | `--host` | `127.0.0.1` | Bind address. Use `0.0.0.0` to serve the LAN. |
 | `MAPFORGE_PORT` | `--port` | `8765` | HTTP port. |
 | `MAPFORGE_TOKEN` | – | unset | When set, every `/api` call needs the header `X-MapForge-Token` (the UI prompts for it once). |
-| `MAPFORGE_MAX_PIXELS` | – | `2000000000` | Per-layer pixel limit. Larger requests are refused with a hint. |
+| `MAPFORGE_MAX_PIXELS` | – | `2000000000` | Per-tile pixel limit (Kongsberg-ready mode). A layer over this — or, for any mode, needing more map tiles than one job safely fetches — is split into a grid of independently-built tiles automatically rather than refused; see [Large areas: automatic tiling](#large-areas-automatic-tiling). |
 | `MAPFORGE_WORKERS` | – | `2` | Jobs processed concurrently. |
 | `MAPFORGE_EXPORT_DIRS` | – | `$MAPFORGE_DATA/exports` | Folders a finished package may be copied into ("Save to folder"), `:`-separated, e.g. mounted shares. Nothing outside them can be written. |
 | `MAPFORGE_USER_AGENT` | – | `MapForge/0.1 …` | User-Agent sent to data providers. |

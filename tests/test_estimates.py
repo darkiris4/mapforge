@@ -18,6 +18,7 @@ from mapforge.sources import faa as faa_mod
 from mapforge.sources.base import Context
 from mapforge.sources.faa import FaaSource, faa_sources
 from mapforge.sources.local import LocalProduct, scan
+from mapforge.sources.maxar import MaxarOpenData, maxar_sources
 from mapforge.sources.services import ArcGISImageServer, CopernicusDEM, TileService, public_service_sources
 from mapforge.sources.ziputil import ZipMember
 
@@ -35,7 +36,7 @@ def settings(tmp_path):
 
 
 # -- contract: plain metadata on every built-in source ---------------------------------
-@pytest.mark.parametrize("src", [*faa_sources(), *public_service_sources()], ids=lambda s: s.id)
+@pytest.mark.parametrize("src", [*faa_sources(), *public_service_sources(), *maxar_sources()], ids=lambda s: s.id)
 def test_every_builtin_source_has_plain_metadata(src):
     info = src.info()
     assert info["category"] in CATEGORIES
@@ -49,7 +50,7 @@ def test_every_builtin_source_has_plain_metadata(src):
 
 
 def test_categories_of_builtins():
-    by_id = {s.id: s.info()["category"] for s in [*faa_sources(), *public_service_sources()]}
+    by_id = {s.id: s.info()["category"] for s in [*faa_sources(), *public_service_sources(), *maxar_sources()]}
     assert by_id["faa-sectional"] == "vfr" and by_id["faa-ifr-low"] == "ifr"
     assert by_id["usgs-naip"] == by_id["s2cloudless-2024"] == by_id["usgs-imagery"] == "imagery"
     assert by_id["copernicus-dem-30"] == by_id["usgs-3dep"] == "elevation"
@@ -281,6 +282,38 @@ def test_estimate_response_contract_and_modes(settings):
     size = (lib / "imgs" / "a.tif").stat().st_size / 1e6
     assert orig["package_mb"] == pytest.approx(size, abs=0.1)
     assert clip["package_mb"] == pytest.approx(size * 0.36, abs=0.1)
+
+
+def test_validate_polygon_derives_bbox_and_requires_three_points(settings):
+    sources.refresh(settings)
+    jm = JobManager(settings)
+    base = {"layers": [{"source": "copernicus-dem-30"}], "bbox": [0, 0, 1, 1]}
+    with pytest.raises(ValueError, match="at least 3 points"):
+        jm.validate({**base, "polygon": [[0, 0], [1, 1]]})
+    # An open ring (no repeated closing point) — the shape drawn on the map — with a bbox that
+    # deliberately disagrees with the polygon: the derived bbox must come from the polygon, not
+    # be trusted from the client, since the fetch envelope and the clip shape must never drift.
+    triangle = [[10.0, 10.0], [12.0, 10.0], [10.0, 12.0]]
+    bbox, layers, outputs, polygon = jm.validate({**base, "bbox": [0, 0, 1, 1], "polygon": triangle})
+    assert bbox.as_tuple() == (10.0, 10.0, 12.0, 12.0)
+    assert polygon[0] == polygon[-1] == (10.0, 10.0), "the ring must come back closed"
+    assert polygon[:-1] == [(10.0, 10.0), (12.0, 10.0), (10.0, 12.0)]
+    # No polygon: bbox is trusted from the client as before, and the 4th return value is None.
+    bbox2, _, _, polygon2 = jm.validate(base)
+    assert bbox2.as_tuple() == (0.0, 0.0, 1.0, 1.0) and polygon2 is None
+
+
+def test_too_big_only_blocks_kongsberg_mode(settings):
+    # "clipped"/"original" never resample to the Kongsberg mosaic grid (they copy/crop each
+    # source file at its own native resolution) — grid_for(bbox, res) exceeding max_pixels is
+    # meaningless for them, and must not block those modes' jobs.
+    settings.max_pixels = 100  # tiny, so any real bbox/res trips the Kongsberg-grid check
+    sources.refresh(settings)
+    jm = JobManager(settings)
+    spec = {"bbox": [-77.2, 38.8, -76.8, 39.0], "layers": [{"source": "copernicus-dem-30", "res_m": 30}]}
+    assert jm.estimate(spec)["layers"][0]["too_big"] is True
+    assert jm.estimate({**spec, "mode": "clipped"})["layers"][0]["too_big"] is False
+    assert jm.estimate({**spec, "mode": "original"})["layers"][0]["too_big"] is False
 
 
 def test_estimate_dted_adds_cells(settings):

@@ -27,7 +27,7 @@ from rasterio.vrt import WarpedVRT
 from rasterio.windows import Window
 
 from .geo import BBox, Grid, grid_for, interior_depth
-from .sources.base import Context, Item, Source
+from .sources.base import Context, Item, Source, TooManyTiles
 
 WGS84 = CRS.from_epsg(4326)
 BLOCK = 1024
@@ -483,7 +483,8 @@ def _summarise_inputs(items: list[Item]) -> list[str]:
 
 
 def build_layer(source: Source, bbox: BBox, lopts: LayerOptions, oopts: OutputOptions, out_dir: Path,
-                ctx: Context, layer_name: str, mode: str = "kongsberg") -> dict:
+                ctx: Context, layer_name: str, mode: str = "kongsberg",
+                clip_polygon: list[tuple[float, float]] | None = None) -> dict:
     if mode != "kongsberg":
         return build_layer_unconverted(source, bbox, lopts, out_dir, ctx, mode)
     # A layer's progress runs 0→1 across phases: fetching inputs, rendering, DTED.
@@ -495,11 +496,19 @@ def build_layer(source: Source, bbox: BBox, lopts: LayerOptions, oopts: OutputOp
     if not items:
         return {"source": source.id, "name": source.name, "status": "empty",
                 "message": "No data from this source intersects the area."}
+    if clip_polygon:
+        # Fetching stays bbox-shaped (every Source works in rectangles); the drawn polygon is
+        # applied here as an extra clip on top of whatever clip each item already carries (e.g.
+        # an FAA chart's own neatline) — render() already ANDs together every polygon in
+        # Item.clip, so this is the entire polygon-clipping implementation.
+        for it in items:
+            it.clip = [*(it.clip or []), clip_polygon]
     res_m = plan_resolution(source, items, lopts)
     grid = grid_for(bbox, res_m)
     if grid.pixels > ctx.settings.max_pixels:
-        raise ValueError(f"{source.name}: {grid.width}x{grid.height} px at {res_m:g} m exceeds the "
-                         f"{ctx.settings.max_pixels:,} pixel limit — use a coarser resolution or smaller area")
+        raise TooManyTiles(f"{source.name}: {grid.width}x{grid.height} px at {res_m:g} m exceeds the "
+                           f"{ctx.settings.max_pixels:,} pixel limit — splitting the area into smaller pieces",
+                           grid.pixels / ctx.settings.max_pixels)
     out_dir.mkdir(parents=True, exist_ok=True)
     # Bounded HTTP timeouts so a dead tile server fails (or is cancelled) promptly.
     env = {"GDAL_CACHEMAX": 512, "GDAL_HTTP_MAX_RETRY": 3, "GDAL_HTTP_RETRY_DELAY": 2,
