@@ -120,8 +120,8 @@ document.addEventListener("keydown", (e) => { if (e.key === "Escape") $("#glossP
 // One job spec, edited by both the guided and the advanced view — switching views keeps it.
 const MODES = {
   kongsberg: {
-    title: "Ready for Kongsberg", tag: "recommended",
-    text: "Cut to your area, stitched into one seamless layer per source, chart margins removed, and converted to latitude/longitude (WGS84) so every layer lines up. Load it straight into TerraLens.",
+    title: "Prepared for Kongsberg", tag: "recommended",
+    text: "Cut to your area, stitched into one seamless layer per source, chart margins removed, and converted to latitude/longitude (WGS84) so every layer lines up. This is TerraLens's expected input format, not its native cache — if your deployment preprocesses or caches raster data before display, run that step on these files first.",
     get: "One GeoTIFF per layer, plus optional COG / MBTiles / DTED terrain cells.",
     tree: "MyArea/\n  01_faa-sectional/faa-sectional.tif\n  02_usgs-naip/usgs-naip.tif\n  03_copernicus-dem-30/dted/w077/n38.dt1\n  README.txt  manifest.json  SHA256SUMS",
   },

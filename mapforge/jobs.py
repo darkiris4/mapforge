@@ -116,17 +116,19 @@ def _build_tile_worker(settings: Settings, source_id: str, bbox_tuple: tuple[flo
 
 # Plain-language explanation of each output mode: (short title, README paragraph lines).
 MODE_TEXT = {
-    "kongsberg": ("Kongsberg-ready (converted)", [
+    "kongsberg": ("Kongsberg-ready (prepared)", [
         "Every layer was merged into one seamless raster per source and reprojected to WGS84",
-        "latitude/longitude (EPSG:4326), with overviews, ready to load into Kongsberg TerraLens."]),
+        "latitude/longitude (EPSG:4326), with overviews — the input TerraLens's own ingestion or",
+        "caching step expects. This is not TerraLens's native format; if your deployment preprocesses",
+        "or caches raster data before display, run that step on these GeoTIFFs before loading."]),
     "clipped": ("Clipped, not converted", [
         "Each source file was cut to your area and otherwise left as it was: its own map projection,",
         "its own colours/palette and data type (elevation stays in metres). Nothing was merged or",
         "reprojected, so files from different sources do not line up pixel-for-pixel, and FAA chart",
         "borders and legends (collars) are still present. Each cut file is lossless unless its source",
         "was already JPEG-compressed imagery, and has internal overviews so it zooms out quickly.",
-        "Use this with GIS tools that handle projections themselves; choose 'Kongsberg-ready' for",
-        "TerraLens."]),
+        "Use this with GIS tools that handle projections themselves; choose 'Kongsberg-ready' to",
+        "prepare input for TerraLens's own ingestion/caching step instead."]),
     "original": ("Original files, untouched", [
         "The source files exactly as their publishers distribute them: whole files, NOT cut to your",
         "area, so they usually cover much more ground than you selected, together with the files",
