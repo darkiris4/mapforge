@@ -12,8 +12,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # ca-certificates: HTTPS to FAA/USGS/AWS. Add your DoD / enterprise CA bundle at runtime
 # (mount it and reference it in an endpoint's "CA bundle" field).
+# libexpat1: rasterio's manylinux wheel dynamically links libexpat.so.1 at import time even
+# though GDAL itself is statically bundled — python:3.12-slim doesn't ship it by default.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates \
+ && apt-get install -y --no-install-recommends ca-certificates libexpat1 \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --create-home --uid 10001 --shell /usr/sbin/nologin mapforge \
  && mkdir -p /data /library \

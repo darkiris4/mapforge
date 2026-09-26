@@ -150,7 +150,7 @@ function layerEstHTML(id) {
       ? ` <span class="tag rough" title="This server's real speed hasn't been measured yet this session — time is a guess based on typical speeds, and will firm up automatically in a few seconds or after the first real download">not yet timed</span>`
       : "") + `</div>`;
   h += sizeGapNote(r.download_mb, pkg);
-  if (r.too_big) h += `<div class="bad">Too much detail for an area this size — choose a lower level or a smaller area.</div>`;
+  if (r.too_big) h += `<div class="hint">More detail than fits in one piece — will auto-split into tiles and build across processes. Takes longer; a lower level or smaller area is faster.</div>`;
   else if (rowSlow(r)) h += `<div class="hint">Slow: this will take a long time. A lower level of detail or a smaller area is much faster.</div>`;
   for (const n of layerNotes(r)) h += `<div class="muted">${esc(n)}</div>`;
   const src = srcById(id);
@@ -183,7 +183,6 @@ function blockers() {
   if (st.delivery.export && !st.delivery.exportRoot) out.push("Pick a server folder, or untick “copy to a server folder”.");
   if (st.delivery.split && !(+st.delivery.splitMb >= MIN_SPLIT_MB)) out.push(`Pieces must be at least ${MIN_SPLIT_MB} MB.`);
   if (estErr) out.push(estErr);
-  if (est?.layers?.some((l) => l.too_big)) out.push("One layer has too much detail for this area.");
   return out;
 }
 function warnings() {
